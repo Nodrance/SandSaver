@@ -2,6 +2,8 @@
 
 mod gfx;
 mod rng;
+#[cfg(test)]
+mod reference;
 mod sim;
 
 use std::sync::mpsc::{self, Receiver, Sender};

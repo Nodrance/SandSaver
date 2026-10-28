@@ -12,6 +12,11 @@ impl Rng {
         Rng(nanos ^ 0x9E37_79B9_7F4A_7C15 | 1)
     }
 
+    #[cfg(test)]
+    pub fn seeded(seed: u64) -> Self {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         let mut x = self.0;
         x ^= x >> 12;
