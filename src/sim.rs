@@ -14,7 +14,48 @@ const GROW_TIME: f32 = 1.2;
 const SHRINK_TIME: f32 = 1.2;
 const EMITTER_FADE: f32 = 0.6;
 const HUE_SPEED: f32 = 3.0; // palette indices per second
-const EMIT_DENSITY: f32 = 0.25; // grains per emitter cell per substep
+
+// ---------------------------------------------------------------------------
+// Tunable parameters
+//
+// Every `*_VARIANCE` is a fraction: a value is drawn uniformly from
+// `mean * (1 - variance) ..= mean * (1 + variance)`, so 0.0 means no variation
+// and 0.5 means plus or minus 50%. Sizes are in pixels of a 1080p screen and
+// scale with the resolution.
+// ---------------------------------------------------------------------------
+
+/// Average number of obstacles on screen. `None` picks a number from the screen
+/// area (roughly one per 130 000 pixels at 1080p), clamped to 3..=120.
+const OBSTACLE_COUNT: Option<usize> = None;
+/// How much the number of obstacles wanted drifts over time.
+const OBSTACLE_COUNT_VARIANCE: f32 = 0.25;
+/// Average time in seconds an obstacle stays fully grown.
+const OBSTACLE_DURATION: f32 = 15.0;
+const OBSTACLE_DURATION_VARIANCE: f32 = 0.33;
+
+/// Average number of sand streams. `None` picks a number from the screen width,
+/// clamped to 3..=8.
+const STREAM_COUNT: Option<usize> = None;
+/// How much the number of streams wanted drifts over time.
+const STREAM_COUNT_VARIANCE: f32 = 0.5;
+/// Average grains per stream cell per substep (0.0 to 1.0).
+const STREAM_DENSITY: f32 = 0.60;
+const STREAM_DENSITY_VARIANCE: f32 = 0.50;
+/// Average stream width in pixels.
+const STREAM_WIDTH: f32 = 30.0;
+const STREAM_WIDTH_VARIANCE: f32 = 0.7;
+/// Average time in seconds a stream flows.
+const STREAM_DURATION: f32 = 7.0;
+const STREAM_DURATION_VARIANCE: f32 = 0.8;
+
+/// The wanted obstacle and stream counts are redrawn this often (seconds,
+/// min and max).
+const COUNT_REDRAW: (f32, f32) = (6.0, 14.0);
+
+/// `mean` varied by up to plus or minus the fraction `variance`.
+fn vary(rng: &mut Rng, mean: f32, variance: f32) -> f32 {
+    mean * (1.0 + variance * rng.range(-1.0, 1.0))
+}
 
 // ---------------------------------------------------------------------------
 // Obstacles
@@ -163,6 +204,7 @@ fn rasterize(cells: &mut [u8], w: usize, h: usize, o: &Obstacle, s: f32, prev: f
 struct Emitter {
     x: f32,
     half_w: f32,
+    density: f32,
     age: f32,
     life: f32,
     hue: f32,
@@ -194,17 +236,24 @@ pub struct World {
     /// Scale factor relative to a 1080p screen.
     unit: f32,
     substeps: usize,
+    /// Average wanted counts, and the currently wanted counts drawn from them.
+    base_obstacles: f32,
+    base_emitters: f32,
     target_obstacles: usize,
     target_emitters: usize,
+    count_timer: f32,
     hue: f32,
 }
 
 impl World {
     pub fn new(w: usize, h: usize) -> Self {
         let unit = h as f32 / 1080.0;
-        let target_obstacles =
-            ((w * h) as f32 / (unit * unit * 130_000.0)).round().clamp(3.0, 120.0) as usize;
-        let target_emitters = (w as f32 / 560.0).round().clamp(3.0, 8.0) as usize;
+        let base_obstacles = OBSTACLE_COUNT.map_or_else(
+            || ((w * h) as f32 / (unit * unit * 130_000.0)).round().clamp(3.0, 120.0),
+            |n| n as f32,
+        );
+        let base_emitters =
+            STREAM_COUNT.map_or_else(|| (w as f32 / 560.0).round().clamp(3.0, 8.0), |n| n as f32);
         let substeps = (h as f32 / 360.0).round().clamp(2.0, 4.0) as usize;
 
         let mut world = World {
@@ -219,10 +268,16 @@ impl World {
             spawn_timer: 0.0,
             unit,
             substeps,
-            target_obstacles,
-            target_emitters,
+            base_obstacles,
+            base_emitters,
+            target_obstacles: 0,
+            target_emitters: 0,
+            count_timer: 0.0,
             hue: 0.0,
         };
+        world.redraw_counts();
+        let target_obstacles = world.target_obstacles;
+        let target_emitters = world.target_emitters;
         for _ in 0..target_obstacles * 3 {
             if world.obstacles.len() >= target_obstacles {
                 break;
@@ -235,8 +290,22 @@ impl World {
         world
     }
 
+    /// Draw new wanted obstacle and stream counts. Extra obstacles and streams
+    /// are not removed; they just are not replaced when they expire.
+    fn redraw_counts(&mut self) {
+        let o = vary(&mut self.rng, self.base_obstacles, OBSTACLE_COUNT_VARIANCE);
+        let e = vary(&mut self.rng, self.base_emitters, STREAM_COUNT_VARIANCE);
+        self.target_obstacles = (o.round().max(0.0) as usize).min(120);
+        self.target_emitters = e.round().max(0.0) as usize;
+        self.count_timer = self.rng.range(COUNT_REDRAW.0, COUNT_REDRAW.1);
+    }
+
     pub fn update(&mut self, dt: f32) {
         self.hue = (self.hue + dt * HUE_SPEED) % SAND_COLORS as f32;
+        self.count_timer -= dt;
+        if self.count_timer <= 0.0 {
+            self.redraw_counts();
+        }
         self.update_obstacles(dt);
         self.update_emitters(dt);
         for _ in 0..self.substeps {
@@ -347,7 +416,7 @@ impl World {
             });
             if clear {
                 let id = self.free_ids.pop().unwrap();
-                let life = self.rng.range(10.0, 26.0);
+                let life = vary(&mut self.rng, OBSTACLE_DURATION, OBSTACLE_DURATION_VARIANCE).max(1.0);
                 self.obstacles.push(Obstacle {
                     shape,
                     cx,
@@ -371,12 +440,14 @@ impl World {
         let k = self.unit;
         let margin = self.w as f32 * 0.02;
         let x = self.rng.range(margin, self.w as f32 - margin);
-        let half_w = self.rng.range(6.0, 24.0) * k;
-        let life = self.rng.range(4.0, 10.0);
+        let half_w = (vary(&mut self.rng, STREAM_WIDTH, STREAM_WIDTH_VARIANCE) * 0.5 * k).max(0.5);
+        let density = vary(&mut self.rng, STREAM_DENSITY, STREAM_DENSITY_VARIANCE).clamp(0.0, 1.0);
+        let life = vary(&mut self.rng, STREAM_DURATION, STREAM_DURATION_VARIANCE).max(2.0 * EMITTER_FADE);
         let hue = self.rng.range(0.0, SAND_COLORS as f32);
         self.emitters.push(Emitter {
             x,
             half_w,
+            density,
             age: age.min(life * 0.5),
             life,
             hue,
@@ -400,7 +471,7 @@ impl World {
         // jammed (a pile has grown up to it); feeding it only builds a spire.
         let probe = (((40.0 * self.unit) as usize).max(4)).min(self.h - 1);
         for e in &self.emitters {
-            let density = EMIT_DENSITY * e.strength();
+            let density = e.density * e.strength();
             if density <= 0.0 {
                 continue;
             }
@@ -435,7 +506,8 @@ impl World {
 // `rows[y]` is non-zero if row `y` may contain sand; empty rows are skipped.
 
 const STRIP: usize = 128;
-/// Counts steps; the scan direction of each row alternates with it.
+/// Counts steps; the scan direction alternates with it, and between pairs of
+/// rows (alternating every row leaves 1-pixel stripes in a stream leaving a slope).
 static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[inline(always)]
@@ -460,7 +532,7 @@ fn flip(s: &mut u64) -> bool {
     *s ^= *s << 13;
     *s ^= *s >> 7;
     *s ^= *s << 17;
-    *s & 1 == 1
+    s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 63 == 1
 }
 
 /// Move grains of `top` into `bot` (the row below). Returns whether any grain
@@ -534,7 +606,7 @@ fn sweep(grid: &Grid, rows: &[u8], w: usize, x0: usize, x1: usize, seed: u64, od
                 std::slice::from_raw_parts_mut(grid.0.add((y + 1) * w + x0), x1 - x0),
             )
         };
-        let rev = (y & 1 == 1) == odd;
+        let rev = ((y >> 1) & 1 == 1) == odd;
         let (stay, land) = move_row(top, bot, rev, &mut rng);
         out[y] |= stay as u8;
         out[y + 1] |= land as u8;
@@ -629,6 +701,56 @@ mod tests {
             step(&mut cells, &rows, w, h, rng.next_u32());
             assert_eq!(count(&cells), n0, "step {f}");
         }
+    }
+
+    /// A stream falling on a 45 degree ramp; prints what falls off its end.
+    fn ramp_run(serial: bool) {
+        let (w, h) = (300usize, 260usize);
+        let mut cells = vec![0u8; w * h];
+        for i in 0..110 {
+            for t in 0..3 {
+                cells[(60 + i + t) * w + 60 + i] = 200;
+            }
+        }
+        let rows = flags(h, 0);
+        let mut rng = Rng::seeded(5);
+        for f in 0..700 {
+            for x in 55..75 {
+                if cells[x] == 0 && rng.f32() < 0.3 {
+                    cells[x] = 1 + (f / 20 % 100) as u8;
+                    rows[0].store(1, Relaxed);
+                }
+            }
+            if serial {
+                r::step_serial(&mut cells, w, h, f, &mut rng);
+            } else {
+                step(&mut cells, &rows, w, h, rng.next_u32());
+            }
+        }
+        println!("RAMP serial={serial} sand={}", cells.iter().filter(|&&v| is_sand(v)).count());
+        let mut pairs = 0;
+        for y in 180..250 {
+            for x in 150..230 {
+                if is_sand(cells[y * w + x]) && is_sand(cells[y * w + x + 1]) {
+                    pairs += 1;
+                }
+            }
+        }
+        println!("STRIPE metric serial={serial} pairs={pairs}");
+        if !serial {
+            assert!(pairs < 20, "stream below a slope forms stripes: {pairs}");
+        }
+        for y in 135..200 {
+            let s: String = (110..190)
+                .map(|x| if is_sand(cells[y * w + x]) { '#' } else if cells[y * w + x] != 0 { '/' } else { '.' })
+                .collect();
+            println!("R{s}");
+        }
+    }
+
+    #[test]
+    fn ramp_picture() {
+        ramp_run(false);
     }
 
     #[test]

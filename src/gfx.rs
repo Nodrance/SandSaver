@@ -2,22 +2,26 @@ use std::sync::Arc;
 
 use winit::window::Window;
 
-const SHADER: &str = r#"
+fn shader(scale: u32) -> String {
+    format!(
+        r#"
 @group(0) @binding(0) var cells: texture_2d<u32>;
 @group(0) @binding(1) var lut: texture_2d<f32>;
 
 @vertex
-fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
     var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
     return vec4<f32>(p[i], 0.0, 1.0);
-}
+}}
 
 @fragment
-fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let c = textureLoad(cells, vec2<i32>(pos.xy), 0).r;
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{
+    let c = textureLoad(cells, vec2<i32>(pos.xy) / {scale}, 0).r;
     return textureLoad(lut, vec2<i32>(i32(c), 0), 0);
+}}
+"#
+    )
 }
-"#;
 
 /// Presents the cell grid: the grid is uploaded as an R8 texture and colored
 /// on the GPU through a 256-entry palette.
@@ -31,10 +35,11 @@ pub struct Gfx {
     lut_view: wgpu::TextureView,
     cells_tex: wgpu::Texture,
     bind_group: wgpu::BindGroup,
+    scale: u32,
 }
 
 impl Gfx {
-    pub async fn new(window: Arc<Window>, lut: &[u32; 256]) -> Self {
+    pub async fn new(window: Arc<Window>, lut: &[u32; 256], scale: u32) -> Self {
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
 
@@ -152,7 +157,7 @@ impl Gfx {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader(scale).into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
@@ -180,7 +185,8 @@ impl Gfx {
             cache: None,
         });
 
-        let (cells_tex, bind_group) = make_cells(&device, &layout, &lut_view, w, h);
+        let (cells_tex, bind_group) =
+            make_cells(&device, &layout, &lut_view, w.div_ceil(scale), h.div_ceil(scale));
 
         Gfx {
             surface,
@@ -192,6 +198,7 @@ impl Gfx {
             lut_view,
             cells_tex,
             bind_group,
+            scale,
         }
     }
 
@@ -199,17 +206,23 @@ impl Gfx {
         (self.config.width, self.config.height)
     }
 
+    /// Size of the cell grid (surface size divided by the scale, rounded up).
+    pub fn cell_size(&self) -> (u32, u32) {
+        (self.config.width.div_ceil(self.scale), self.config.height.div_ceil(self.scale))
+    }
+
     pub fn resize(&mut self, w: u32, h: u32) {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        let (tex, bg) = make_cells(&self.device, &self.layout, &self.lut_view, w, h);
+        let (cw, ch) = self.cell_size();
+        let (tex, bg) = make_cells(&self.device, &self.layout, &self.lut_view, cw, ch);
         self.cells_tex = tex;
         self.bind_group = bg;
     }
 
     pub fn upload(&self, cells: &[u8]) {
-        let (w, h) = self.size();
+        let (w, h) = self.cell_size();
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.cells_tex,

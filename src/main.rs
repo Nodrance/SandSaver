@@ -24,6 +24,11 @@ use sim::{World, OBSTACLE_BASE, SAND_COLORS};
 const STEP: f32 = 1.0 / 60.0;
 const MOUSE_EXIT_DISTANCE: f64 = 12.0;
 const MAX_INFLIGHT: usize = 4;
+/// Integer resolution divider: the simulation grid is the screen resolution
+/// divided by this (1 = full resolution, 2 = half, 3 = a third, ...). Each
+/// cell is drawn as a SCALE x SCALE block of pixels.
+const SCALE: u32 = 8;
+const _: () = assert!(SCALE >= 1);
 /// Input is ignored briefly after startup so launch-time key/mouse events don't exit immediately.
 const INPUT_GRACE: Duration = Duration::from_millis(1500);
 
@@ -138,11 +143,11 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        let (w, h) = (size.width as usize, size.height as usize);
-
         if gfx.size() != (size.width, size.height) {
             gfx.resize(size.width, size.height);
         }
+        let (cw, ch) = gfx.cell_size();
+        let (w, h) = (cw as usize, ch as usize);
         if self.sim.as_ref().map_or(true, |s| s.w != w || s.h != h) {
             self.sim = Some(SimThread::new(w, h));
             self.accumulator = STEP; // kick off the first step immediately
@@ -193,7 +198,7 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).expect("failed to create window"));
         window.set_cursor_visible(false);
 
-        self.gfx = Some(pollster::block_on(Gfx::new(window.clone(), &build_lut())));
+        self.gfx = Some(pollster::block_on(Gfx::new(window.clone(), &build_lut(), SCALE)));
         self.window = Some(window);
         self.last_tick = Instant::now();
         self.started = Instant::now();
