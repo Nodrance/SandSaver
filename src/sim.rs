@@ -1,7 +1,13 @@
-﻿use rayon::prelude::*;
+use rayon::prelude::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use crate::rng::Rng;
+
+mod generate;
+mod shapes;
+
+use generate::{Flow, Vanished};
+use shapes::{Hole, Kind, Obstacle, Shape};
 
 const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
 const HIGH: u64 = 0x8080_8080_8080_8080;
@@ -13,7 +19,7 @@ pub const SAND_COLORS: u32 = 127;
 const GROW_TIME: f32 = 1.2;
 const SHRINK_TIME: f32 = 1.2;
 const EMITTER_FADE: f32 = 0.6;
-const HUE_SPEED: f32 = 3.0; // palette indices per second
+const HUE_SPEED: f32 = 8.0; // palette indices per second
 
 // ---------------------------------------------------------------------------
 // Tunable parameters
@@ -35,166 +41,73 @@ const OBSTACLE_DURATION_VARIANCE: f32 = 0.33;
 
 /// Average number of sand streams. `None` picks a number from the screen width,
 /// clamped to 3..=8.
-const STREAM_COUNT: Option<usize> = None;
+const STREAM_COUNT: Option<usize> = Some(8);
 /// How much the number of streams wanted drifts over time.
 const STREAM_COUNT_VARIANCE: f32 = 0.5;
 /// Average grains per stream cell per substep (0.0 to 1.0).
-const STREAM_DENSITY: f32 = 0.60;
-const STREAM_DENSITY_VARIANCE: f32 = 0.50;
+const STREAM_DENSITY: f32 = 0.50;
+const STREAM_DENSITY_VARIANCE: f32 = 1.00;
 /// Average stream width in pixels.
 const STREAM_WIDTH: f32 = 30.0;
 const STREAM_WIDTH_VARIANCE: f32 = 0.7;
 /// Average time in seconds a stream flows.
-const STREAM_DURATION: f32 = 7.0;
+const STREAM_DURATION: f32 = 3.0;
 const STREAM_DURATION_VARIANCE: f32 = 0.8;
 
 /// The wanted obstacle and stream counts are redrawn this often (seconds,
 /// min and max).
 const COUNT_REDRAW: (f32, f32) = (6.0, 14.0);
 
+// --- What obstacles are made of ---------------------------------------------
+//
+// Relative frequencies of each kind. Holes cut into existing obstacles, so
+// they only appear once there is something to cut; they count towards the
+// obstacle count. A funnel counts as one obstacle.
+const SLOPE_WEIGHT: f32 = 3.0;
+const DIAMOND_WEIGHT: f32 = 1.2;
+const CIRCLE_WEIGHT: f32 = 1.4;
+const FUNNEL_WEIGHT: f32 = 1.0;
+const LONG_HOLE_WEIGHT: f32 = 1.2;
+const CIRCLE_HOLE_WEIGHT: f32 = 1.2;
+/// Average time in seconds a hole stays open (never longer than its obstacle).
+const HOLE_DURATION: f32 = 10.0;
+const HOLE_DURATION_VARIANCE: f32 = 0.4;
+
+// --- How streams and obstacles influence each other (0.0 to 1.0) --------------
+//
+/// How strongly streams pull obstacles towards them: which kind is built,
+/// and building it under a stream rather than anywhere. 0.0 ignores streams.
+const STREAMS_ATTRACT_OBSTACLES: f32 = 0.8;
+/// How strongly obstacles pull streams towards them: new streams start above
+/// obstacles rather than anywhere. 0.0 ignores obstacles.
+const OBSTACLES_ATTRACT_STREAMS: f32 = 0.6;
+/// How strongly a new obstacle is placed so that the stream it makes falls
+/// onto another obstacle, rather than being the first acceptable spot.
+const OBSTACLE_CHAINING: f32 = 0.7;
+/// Streams wider than this (pixels, counting touching streams) are "wide".
+const WIDE_STREAM: f32 = 60.0;
+
+// --- Weirdness (0.0 follows the rules strictly, 1.0 lets chance take over) ---
+//
+/// Chance the kind of obstacle ignores what the streams suggest.
+const WEIRD_KIND: f32 = 0.15;
+/// Chance an obstacle or stream is placed anywhere instead of by the rules.
+const WEIRD_PLACEMENT: f32 = 0.15;
+/// Chance of unusual angles and proportions: slopes outside 30-60 degrees,
+/// lopsided funnels, craters instead of clean cuts.
+const WEIRD_SHAPE: f32 = 0.15;
+/// Chance an obstacle may overlap others.
+const WEIRD_OVERLAP: f32 = 0.10;
+/// Chance a slope redirects a stream forwards instead of backwards.
+const WEIRD_REDIRECT: f32 = 0.15;
+/// Chance something may recreate a stream that has only just vanished.
+const WEIRD_LOOPS: f32 = 0.10;
+/// How long (seconds) a vanished stream is remembered.
+const LOOP_MEMORY: f32 = 8.0;
+
 /// `mean` varied by up to plus or minus the fraction `variance`.
 fn vary(rng: &mut Rng, mean: f32, variance: f32) -> f32 {
     mean * (1.0 + variance * rng.range(-1.0, 1.0))
-}
-
-// ---------------------------------------------------------------------------
-// Obstacles
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy)]
-enum Kind {
-    Rect { hl: f32, ht: f32 },
-    Circle { r: f32 },
-    /// Lower half of an annulus (a cup).
-    Bowl { r: f32, t: f32 },
-    Tri { v: [(f32, f32); 3] },
-}
-
-#[derive(Clone, Copy)]
-struct Shape {
-    kind: Kind,
-    cos: f32,
-    sin: f32,
-}
-
-impl Shape {
-    fn new(kind: Kind, angle: f32) -> Self {
-        Shape {
-            kind,
-            cos: angle.cos(),
-            sin: angle.sin(),
-        }
-    }
-
-    fn radius(&self) -> f32 {
-        match self.kind {
-            Kind::Rect { hl, ht } => hl.hypot(ht),
-            Kind::Circle { r } | Kind::Bowl { r, .. } => r,
-            Kind::Tri { v } => v.iter().map(|p| p.0.hypot(p.1)).fold(0.0, f32::max),
-        }
-    }
-
-    /// Half extents of the axis-aligned bounding box.
-    fn extent(&self) -> (f32, f32) {
-        let (c, s) = (self.cos.abs(), self.sin.abs());
-        match self.kind {
-            Kind::Rect { hl, ht } => (hl * c + ht * s, hl * s + ht * c),
-            Kind::Circle { r } | Kind::Bowl { r, .. } => (r, r),
-            Kind::Tri { v } => {
-                let (mut ex, mut ey) = (0.0f32, 0.0f32);
-                for (lx, ly) in v {
-                    ex = ex.max((lx * self.cos - ly * self.sin).abs());
-                    ey = ey.max((lx * self.sin + ly * self.cos).abs());
-                }
-                (ex, ey)
-            }
-        }
-    }
-
-    /// Whether the point (dx, dy), relative to the shape centre, lies inside
-    /// the shape scaled by `s`.
-    fn contains(&self, dx: f32, dy: f32, s: f32) -> bool {
-        if s <= 0.0 {
-            return false;
-        }
-        let inv = 1.0 / s;
-        let lx = (dx * self.cos + dy * self.sin) * inv;
-        let ly = (-dx * self.sin + dy * self.cos) * inv;
-        match self.kind {
-            Kind::Rect { hl, ht } => lx.abs() <= hl && ly.abs() <= ht,
-            Kind::Circle { r } => lx * lx + ly * ly <= r * r,
-            Kind::Bowl { r, t } => {
-                let d2 = lx * lx + ly * ly;
-                let ri = r - t;
-                ly >= 0.0 && d2 <= r * r && d2 >= ri * ri
-            }
-            Kind::Tri { v } => {
-                let edge = |a: (f32, f32), b: (f32, f32)| (lx - b.0) * (a.1 - b.1) - (a.0 - b.0) * (ly - b.1);
-                let d1 = edge(v[0], v[1]);
-                let d2 = edge(v[1], v[2]);
-                let d3 = edge(v[2], v[0]);
-                let neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-                let pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-                !(neg && pos)
-            }
-        }
-    }
-}
-
-struct Obstacle {
-    shape: Shape,
-    cx: f32,
-    cy: f32,
-    radius: f32,
-    ex: f32,
-    ey: f32,
-    id: u8,
-    age: f32,
-    life: f32,
-    applied: f32,
-}
-
-impl Obstacle {
-    fn scale(&self) -> f32 {
-        let grow = (self.age / GROW_TIME).clamp(0.0, 1.0);
-        let shrink = ((self.life + SHRINK_TIME - self.age) / SHRINK_TIME).clamp(0.0, 1.0);
-        let t = grow.min(shrink);
-        t * t * (3.0 - 2.0 * t)
-    }
-
-    fn finished(&self) -> bool {
-        self.age >= self.life + SHRINK_TIME && self.applied <= 0.0
-    }
-}
-
-/// Paint the obstacle at scale `s`. `prev` is the scale it was last painted
-/// at; only the region covered by either scale needs visiting.
-fn rasterize(cells: &mut [u8], w: usize, h: usize, o: &Obstacle, s: f32, prev: f32) {
-    let m = s.max(prev).max(0.0);
-    let x0 = (o.cx - o.ex * m - 2.0).floor().max(0.0) as usize;
-    let x1 = ((o.cx + o.ex * m + 2.0).ceil().max(0.0) as usize).min(w);
-    let y0 = (o.cy - o.ey * m - 2.0).floor().max(0.0) as usize;
-    let y1 = ((o.cy + o.ey * m + 2.0).ceil().max(0.0) as usize).min(h);
-    if x0 >= x1 || y0 >= y1 {
-        return;
-    }
-    cells[y0 * w..y1 * w]
-        .par_chunks_mut(w)
-        .enumerate()
-        .for_each(|(i, row)| {
-            let dy = (y0 + i) as f32 + 0.5 - o.cy;
-            for x in x0..x1 {
-                let dx = x as f32 + 0.5 - o.cx;
-                let cell = &mut row[x];
-                if o.shape.contains(dx, dy, s) {
-                    if *cell < OBSTACLE_BASE {
-                        *cell = o.id;
-                    }
-                } else if *cell == o.id {
-                    *cell = 0;
-                }
-            }
-        });
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +146,11 @@ pub struct World {
     free_ids: Vec<u8>,
     emitters: Vec<Emitter>,
     spawn_timer: f32,
+    /// Predicted streams, refreshed regularly, and where streams recently
+    /// vanished.
+    flows: Vec<Flow>,
+    flow_timer: f32,
+    vanished: Vec<Vanished>,
     /// Scale factor relative to a 1080p screen.
     unit: f32,
     substeps: usize,
@@ -266,6 +184,9 @@ impl World {
             free_ids: (OBSTACLE_BASE..=255).rev().collect(),
             emitters: Vec::new(),
             spawn_timer: 0.0,
+            flows: Vec::new(),
+            flow_timer: 0.0,
+            vanished: Vec::new(),
             unit,
             substeps,
             base_obstacles,
@@ -278,16 +199,28 @@ impl World {
         world.redraw_counts();
         let target_obstacles = world.target_obstacles;
         let target_emitters = world.target_emitters;
+        // Streams first, so the obstacles have something to react to; the
+        // rest of the streams then react to the obstacles.
+        for _ in 0..target_emitters.div_ceil(2) {
+            world.spawn_emitter(0.0);
+        }
         for _ in 0..target_obstacles * 3 {
-            if world.obstacles.len() >= target_obstacles {
+            if world.obstacle_count() >= target_obstacles {
                 break;
             }
             world.spawn_obstacle();
         }
-        for _ in 0..target_emitters {
+        for _ in world.emitters.len()..target_emitters {
             world.spawn_emitter(0.0);
         }
+        world.flows = world.trace_flows();
         world
+    }
+
+    /// Obstacles and holes, counting a funnel once.
+    fn obstacle_count(&self) -> usize {
+        let holes = self.obstacles.iter().flat_map(|o| &o.holes).filter(|h| h.primary).count();
+        self.obstacles.iter().filter(|o| !o.part).count() + holes
     }
 
     /// Draw new wanted obstacle and stream counts. Extra obstacles and streams
@@ -308,6 +241,15 @@ impl World {
         }
         self.update_obstacles(dt);
         self.update_emitters(dt);
+        self.flow_timer -= dt;
+        if self.flow_timer <= 0.0 {
+            self.flows = self.trace_flows();
+            self.flow_timer = 0.5;
+        }
+        for v in &mut self.vanished {
+            v.ttl -= dt;
+        }
+        self.vanished.retain(|v| v.ttl > 0.0);
         for _ in 0..self.substeps {
             self.emit();
             let bits = self.rng.next_u32();
@@ -320,11 +262,13 @@ impl World {
     fn update_obstacles(&mut self, dt: f32) {
         let (w, h) = (self.w, self.h);
         for o in self.obstacles.iter_mut() {
-            o.age += dt;
-            let s = o.scale();
-            if s != o.applied {
-                rasterize(&mut self.cells, w, h, o, s, o.applied);
-                o.applied = s;
+            shapes::update(&mut self.cells, w, h, o, dt);
+            if !o.retired && o.age >= o.life {
+                // The streams falling off it are about to vanish.
+                o.retired = true;
+                for f in self.flows.iter().filter(|f| f.src == Some(o.id)) {
+                    self.vanished.push(Vanished { x: f.x, y: f.y, ttl: LOOP_MEMORY });
+                }
             }
         }
         let free_ids = &mut self.free_ids;
@@ -337,7 +281,7 @@ impl World {
             }
         });
 
-        if self.obstacles.len() < self.target_obstacles {
+        if self.obstacle_count() < self.target_obstacles {
             self.spawn_timer -= dt;
             if self.spawn_timer <= 0.0 {
                 self.spawn_obstacle();
@@ -346,100 +290,11 @@ impl World {
         }
     }
 
-    fn random_shape(&mut self) -> Shape {
-        let k = self.unit;
-        let rng = &mut self.rng;
-        match rng.below(100) {
-            // Ramp
-            0..=39 => {
-                let angle = rng.sign() * rng.range(25.0, 55.0).to_radians();
-                Shape::new(
-                    Kind::Rect {
-                        hl: rng.range(120.0, 280.0) * k,
-                        ht: rng.range(6.0, 10.0) * k,
-                    },
-                    angle,
-                )
-            }
-            // Circle
-            40..=54 => Shape::new(Kind::Circle { r: rng.range(40.0, 110.0) * k }, 0.0),
-            // Bowl
-            55..=69 => Shape::new(
-                Kind::Bowl {
-                    r: rng.range(70.0, 140.0) * k,
-                    t: rng.range(8.0, 14.0) * k,
-                },
-                rng.sign() * rng.range(0.0, 35.0).to_radians(),
-            ),
-            // Triangle
-            70..=84 => {
-                let bw = rng.range(50.0, 120.0) * k;
-                let hh = rng.range(60.0, 150.0) * k;
-                Shape::new(
-                    Kind::Tri {
-                        v: [(-bw, hh * 0.5), (bw, hh * 0.5), (0.0, -hh * 0.5)],
-                    },
-                    rng.range(0.0, std::f32::consts::TAU),
-                )
-            }
-            // Box
-            _ => Shape::new(
-                Kind::Rect {
-                    hl: rng.range(35.0, 110.0) * k,
-                    ht: rng.range(30.0, 70.0) * k,
-                },
-                rng.range(0.0, std::f32::consts::PI),
-            ),
-        }
-    }
-
-    fn spawn_obstacle(&mut self) {
-        if self.free_ids.is_empty() {
-            return;
-        }
-        let shape = self.random_shape();
-        let radius = shape.radius();
-        let (ex, ey) = shape.extent();
-        let (w, h) = (self.w as f32, self.h as f32);
-
-        let x_lo = radius * 0.5;
-        let x_hi = (w - radius * 0.5).max(x_lo + 1.0);
-        let y_lo = h * 0.10 + radius * 0.7;
-        let y_hi = (h - radius * 0.7).max(y_lo + 1.0);
-
-        for _ in 0..30 {
-            let cx = self.rng.range(x_lo, x_hi);
-            let cy = self.rng.range(y_lo, y_hi);
-            let clear = self.obstacles.iter().all(|o| {
-                let d = (o.cx - cx).hypot(o.cy - cy);
-                d >= (o.radius + radius) * 0.6
-            });
-            if clear {
-                let id = self.free_ids.pop().unwrap();
-                let life = vary(&mut self.rng, OBSTACLE_DURATION, OBSTACLE_DURATION_VARIANCE).max(1.0);
-                self.obstacles.push(Obstacle {
-                    shape,
-                    cx,
-                    cy,
-                    radius,
-                    ex,
-                    ey,
-                    id,
-                    age: 0.0,
-                    life,
-                    applied: -1.0,
-                });
-                return;
-            }
-        }
-    }
-
     // -- emitters -----------------------------------------------------------
 
     fn spawn_emitter(&mut self, age: f32) {
         let k = self.unit;
-        let margin = self.w as f32 * 0.02;
-        let x = self.rng.range(margin, self.w as f32 - margin);
+        let x = self.emitter_x();
         let half_w = (vary(&mut self.rng, STREAM_WIDTH, STREAM_WIDTH_VARIANCE) * 0.5 * k).max(0.5);
         let density = vary(&mut self.rng, STREAM_DENSITY, STREAM_DENSITY_VARIANCE).clamp(0.0, 1.0);
         let life = vary(&mut self.rng, STREAM_DURATION, STREAM_DURATION_VARIANCE).max(2.0 * EMITTER_FADE);
@@ -458,6 +313,9 @@ impl World {
         for e in self.emitters.iter_mut() {
             e.age += dt;
             e.hue = (e.hue + dt * HUE_SPEED) % SAND_COLORS as f32;
+        }
+        for e in self.emitters.iter().filter(|e| e.age >= e.life) {
+            self.vanished.push(Vanished { x: e.x, y: 0.0, ttl: LOOP_MEMORY });
         }
         self.emitters.retain(|e| e.age < e.life);
         while self.emitters.len() < self.target_emitters {

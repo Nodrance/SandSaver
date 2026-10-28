@@ -27,7 +27,7 @@ const MAX_INFLIGHT: usize = 4;
 /// Integer resolution divider: the simulation grid is the screen resolution
 /// divided by this (1 = full resolution, 2 = half, 3 = a third, ...). Each
 /// cell is drawn as a SCALE x SCALE block of pixels.
-const SCALE: u32 = 8;
+const SCALE: u32 = 2;
 const _: () = assert!(SCALE >= 1);
 /// Input is ignored briefly after startup so launch-time key/mouse events don't exit immediately.
 const INPUT_GRACE: Duration = Duration::from_millis(1500);
