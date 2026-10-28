@@ -176,6 +176,36 @@ pub fn write_png(path: &str, w: usize, h: usize, rgb: &[u8]) {
     std::fs::write(path, out).unwrap();
 }
 
+/// Coarse text rendering: each character covers `bw` x `bh` cells.
+pub fn ascii(cells: &[u8], w: usize, h: usize, bw: usize, bh: usize) -> String {
+    let mut s = String::new();
+    for by in 0..h / bh {
+        for bx in 0..w / bw {
+            let (mut sand, mut obs) = (0, 0);
+            for y in by * bh..(by + 1) * bh {
+                for x in bx * bw..(bx + 1) * bw {
+                    let c = cells[y * w + x];
+                    if c >= OBSTACLE_BASE {
+                        obs += 1;
+                    } else if c != 0 {
+                        sand += 1;
+                    }
+                }
+            }
+            let n = bw * bh;
+            s.push(if obs * 2 > n {
+                '#'
+            } else if sand == 0 {
+                ' '
+            } else {
+                [',', ':', 'o', 'O', '@'][(sand * 5 - 1) / n]
+            });
+        }
+        s.push('\n');
+    }
+    s
+}
+
 #[test]
 fn reference_picture() {
     let mut rng = Rng::seeded(1);
@@ -183,6 +213,11 @@ fn reference_picture() {
     for f in 0..2500 {
         emit(&mut cells, &mut rng, f);
         step_serial(&mut cells, W, H, f, &mut rng);
+        if f % 500 == 499 {
+            let n = cells.iter().filter(|&&v| v != 0 && v < OBSTACLE_BASE).count();
+            println!("REF grains at {f}: {n}");
+        }
     }
     write_png("target/ref.png", W, H, &render(&cells));
+    println!("REFERENCE\n{}", ascii(&cells, W, H, 4, 6));
 }

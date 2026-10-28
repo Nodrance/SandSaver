@@ -1,5 +1,5 @@
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+﻿use rayon::prelude::*;
+use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use crate::rng::Rng;
 
@@ -128,7 +128,7 @@ impl Obstacle {
 
 /// Paint the obstacle at scale `s`. `prev` is the scale it was last painted
 /// at; only the region covered by either scale needs visiting.
-fn rasterize(cells: &mut [u8], track: &mut Track, w: usize, h: usize, o: &Obstacle, s: f32, prev: f32) {
+fn rasterize(cells: &mut [u8], w: usize, h: usize, o: &Obstacle, s: f32, prev: f32) {
     let m = s.max(prev).max(0.0);
     let x0 = (o.cx - o.ex * m - 2.0).floor().max(0.0) as usize;
     let x1 = ((o.cx + o.ex * m + 2.0).ceil().max(0.0) as usize).min(w);
@@ -154,9 +154,8 @@ fn rasterize(cells: &mut [u8], track: &mut Track, w: usize, h: usize, o: &Obstac
                 }
             }
         });
-    // The back buffer no longer matches the front one here.
-    track.mark_dirty_rect(x0, x1, y0, y1);
 }
+
 // ---------------------------------------------------------------------------
 // Emitters
 // ---------------------------------------------------------------------------
@@ -185,9 +184,8 @@ pub struct World {
     pub w: usize,
     pub h: usize,
     pub cells: Vec<u8>,
-    /// Back buffer. It equals `cells` except in the chunks flagged in `dirty`.
-    scratch: Vec<u8>,
-    track: Track,
+    /// Per row: non-zero if the row may contain sand.
+    row_sand: Vec<AtomicU8>,
     rng: Rng,
     obstacles: Vec<Obstacle>,
     free_ids: Vec<u8>,
@@ -213,8 +211,7 @@ impl World {
             w,
             h,
             cells: vec![0; w * h],
-            scratch: vec![0; w * h],
-            track: Track::new(w, h),
+            row_sand: (0..h).map(|_| AtomicU8::new(0)).collect(),
             rng: Rng::new(),
             obstacles: Vec::new(),
             free_ids: (OBSTACLE_BASE..=255).rev().collect(),
@@ -244,12 +241,11 @@ impl World {
         self.update_emitters(dt);
         for _ in 0..self.substeps {
             self.emit();
-            let seed = self.rng.next_u32();
-            step(&self.cells, &mut self.scratch, &mut self.track, self.w, self.h, seed);
-            std::mem::swap(&mut self.cells, &mut self.scratch);
+            let bits = self.rng.next_u32();
+            step(&mut self.cells, &self.row_sand, self.w, self.h, bits);
         }
     }
-    
+
     // -- obstacles ----------------------------------------------------------
 
     fn update_obstacles(&mut self, dt: f32) {
@@ -258,7 +254,7 @@ impl World {
             o.age += dt;
             let s = o.scale();
             if s != o.applied {
-                rasterize(&mut self.cells, &mut self.track, w, h, o, s, o.applied);
+                rasterize(&mut self.cells, w, h, o, s, o.applied);
                 o.applied = s;
             }
         }
@@ -415,459 +411,250 @@ impl World {
                 if !jammed && self.cells[x] == 0 && self.rng.chance(density) {
                     let idx = (e.hue as u32 + self.rng.below(4)) % SAND_COLORS;
                     self.cells[x] = 1 + idx as u8;
-                    self.track.mark_sand(x, 0);
+                    self.row_sand[0].store(1, Relaxed);
                 }
             }
         }
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Sand physics
 // ---------------------------------------------------------------------------
+//
+// The grid is cut into column strips that run in parallel. Each strip does an
+// ordinary serial bottom-up scan, in place: a grain falls if the cell below is
+// empty, otherwise it slides to a free lower diagonal. Because rows are done
+// bottom-up, a hole left by one grain is filled by the grain above in the same
+// step, so stacks fall and heaps slump the way a single-threaded scan does.
+//
+// Grains cannot cross a strip boundary during a step. The boundaries move to a
+// random place every step, so nothing can pile up against one.
+//
+// `rows[y]` is non-zero if row `y` may contain sand; empty rows are skipped.
 
-const CHUNK: usize = 8;
-
-fn chunk_count(w: usize) -> usize {
-    w.div_ceil(CHUNK)
-}
-
-/// Bookkeeping that lets `step` visit only the parts of the grid that matter.
-/// Everything is per 8-cell chunk, stored as one bit per chunk and row.
-struct Track {
-    nc: usize,
-    wpr: usize,
-    h: usize,
-    /// Chunks where the back buffer may differ from the front buffer.
-    dirty: Vec<u64>,
-    /// Chunks that may change in the next step: they hold sand, or sand sits
-    /// in the chunks above/diagonally above. Two sets, read and written
-    /// alternately.
-    cand: [Vec<AtomicU64>; 2],
-    ci: usize,
-    /// Per 64-cell strip, one word per row: bit set = the grain there falls
-    /// straight down this step. Laid out strip-major so strips are independent.
-    falls: Vec<u64>,
-}
-
-impl Track {
-    fn new(w: usize, h: usize) -> Self {
-        let nc = chunk_count(w);
-        let wpr = nc.div_ceil(64);
-        let bits = |n| (0..n).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
-        Track {
-            nc,
-            wpr,
-            h,
-            dirty: vec![0; wpr * h],
-            cand: [bits(wpr * h), bits(wpr * h)],
-            ci: 0,
-            falls: vec![0; w.div_ceil(64) * h],
-        }
-    }
-
-    /// The back buffer is stale in this rectangle of cells.
-    fn mark_dirty_rect(&mut self, x0: usize, x1: usize, y0: usize, y1: usize) {
-        for y in y0..y1 {
-            for c in x0 / CHUNK..=(x1 - 1) / CHUNK {
-                self.dirty[y * self.wpr + (c >> 6)] |= 1u64 << (c & 63);
-            }
-        }
-    }
-
-    /// Sand was placed at (x, y) in the front buffer.
-    fn mark_sand(&self, x: usize, y: usize) {
-        mark_candidates(&self.cand[self.ci], self.wpr, self.nc, self.h, y, x / CHUNK);
-    }
-}
-
-/// Flag chunk `c` of row `y` and the three chunks below it, which are the
-/// ones whose cells sand in that chunk can move into.
-fn mark_candidates(cand: &[AtomicU64], wpr: usize, nc: usize, h: usize, y: usize, c: usize) {
-    let set = |y: usize, c: usize| {
-        cand[y * wpr + (c >> 6)].fetch_or(1u64 << (c & 63), Ordering::Relaxed);
-    };
-    set(y, c);
-    if y + 1 < h {
-        for c2 in c.saturating_sub(1)..=(c + 1).min(nc - 1) {
-            set(y + 1, c2);
-        }
-    }
-}
-
-/// One falling-sand step, double buffered: `dst` is computed purely from
-/// `src`, so every output row is independent and rows run fully in parallel
-/// with no waiting and no seams.
-///
-/// `dst` holds the state from two steps ago and is only repaired where needed
-/// (see `Track`). On return `dst` is the new state and the roles flip: `src`
-/// becomes the back buffer.
-///
-/// Each grain's intent depends only on `src`: fall straight down if that cell
-/// is free, otherwise slide to a free lower diagonal. Conflicts over a target
-/// cell are settled the same way from both sides: a straight fall beats a
-/// diagonal, and two diagonals tie-break on a per-cell hash. A grain moves iff
-/// it wins its target, and a target takes the grain that wins it, so grains are
-/// conserved. Sand reaching the bottom row is removed on the following step.
-fn step(src: &[u8], dst: &mut [u8], track: &mut Track, w: usize, h: usize, seed: u32) {
-    let zeros = vec![0u8; w];
-    let blocked = vec![255u8; w];
-    let Track { nc, wpr, dirty, cand, ci, falls, .. } = track;
-    let (nc, wpr) = (*nc, *wpr);
-    let cand_cur = &cand[*ci][..];
-    let cand_next = &cand[*ci ^ 1][..];
-    compute_falls(src, falls, cand_cur, w, h, wpr, seed);
-    let falls = &falls[..];
-    dst.par_chunks_mut(w)
-        .zip(dirty.par_chunks_mut(wpr))
-        .enumerate()
-        .with_min_len(8)
-        .for_each(|(y, (out, flags))| {
-            let cur = &src[y * w..(y + 1) * w];
-            let up = if y > 0 { &src[(y - 1) * w..y * w] } else { &zeros[..] };
-            let dn = if y + 1 < h { &src[(y + 1) * w..(y + 2) * w] } else { &blocked[..] };
-            let hs_up = mix(seed, y.wrapping_sub(1) as u32);
-            let hs = mix(seed, y as u32);
-            let mc = FallRow { bits: falls, h, y };
-            let mu = FallRow { bits: falls, h, y: y.wrapping_sub(1) };
-            let row = Row { up, cur, dn, mc, mu, hs_up, hs, y, h, nc };
-            process_row(&row, out, flags, &cand_cur[y * wpr..(y + 1) * wpr], cand_next, wpr);
-        });
-    *ci ^= 1;
-}
-
-#[derive(Clone, Copy)]
-struct Row<'a> {
-    up: &'a [u8],
-    cur: &'a [u8],
-    dn: &'a [u8],
-    mc: FallRow<'a>,
-    mu: FallRow<'a>,
-    hs_up: u32,
-    hs: u32,
-    y: usize,
-    h: usize,
-    nc: usize,
-}
-
-const TIE: u32 = 0xA5A5_A5A5;
+const STRIP: usize = 128;
+/// Counts steps; the scan direction of each row alternates with it.
+static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[inline(always)]
-fn is_sand(c: u8) -> bool {
-    c != 0 && c < OBSTACLE_BASE
+fn is_sand(v: u8) -> bool {
+    v.wrapping_sub(1) < OBSTACLE_BASE - 1
+}
+
+/// 0x80 in every byte lane holding sand (1..=127).
+#[inline(always)]
+fn sandm(v: u64) -> u64 {
+    (((v & LOW7).wrapping_add(LOW7)) & !v) & HIGH
 }
 
 #[inline(always)]
-fn mix(a: u32, b: u32) -> u32 {
-    let mut z = a.wrapping_mul(0x9E37_79B1) ^ b.wrapping_mul(0x85EB_CA6B);
-    z ^= z >> 15;
-    z = z.wrapping_mul(0x2C1B_3C6D);
-    z ^= z >> 12;
-    z = z.wrapping_mul(0x297A_2D39);
-    z ^ (z >> 15)
+fn rd(s: &[u8]) -> u64 {
+    u64::from_le_bytes(s.try_into().unwrap())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Dir {
-    Stay,
-    Down,
-    Left,
-    Right,
-}
-
-/// One row of the per-step "falls straight down" bitmap (see `compute_falls`).
-#[derive(Clone, Copy)]
-struct FallRow<'a> {
-    bits: &'a [u64],
-    h: usize,
-    y: usize,
-}
-
-impl FallRow<'_> {
-    #[inline(always)]
-    fn get(&self, x: usize) -> bool {
-        (self.bits[(x >> 6) * self.h + self.y] >> (x & 63)) & 1 != 0
-    }
-
-    /// The eight cells of chunk `c`, one bit each.
-    #[inline(always)]
-    fn chunk(&self, c: usize) -> u8 {
-        (self.bits[(c >> 3) * self.h + self.y] >> ((c & 7) * 8)) as u8
-    }
-}
-
-/// Work out which grains fall straight down this step. A grain falls if the
-/// cell below is empty or holds a grain that is certain to move away (falls,
-/// slides, or is swept off the bottom row), so a whole column of sand above a
-/// gap drops as one block, as it would in a bottom-up in-place update.
-/// Columns are independent, so 64-cell strips run in parallel and each walks
-/// its rows bottom-up. Only chunks that can hold sand are looked at.
-///
-/// A slide only counts as certain when nothing can contest its target (see
-/// `slide_ok`); `resolve` then agrees. Uncertain slides just make the grain
-/// above wait a step.
-fn compute_falls(
-    src: &[u8],
-    falls: &mut [u64],
-    cand: &[AtomicU64],
-    w: usize,
-    h: usize,
-    wpr: usize,
-    seed: u32,
-) {
-    let rd = |r: &[u8], i: usize| u64::from_le_bytes(r[i..i + 8].try_into().unwrap());
-    let sandm = |v: u64| (((v & LOW7).wrapping_add(LOW7)) & !v) & HIGH;
-    let nz = |v: u64| (((v & LOW7).wrapping_add(LOW7)) | v) & HIGH;
-    let mask8 = |v: u64| ((v & HIGH) >> 7).wrapping_mul(0x0102_0408_1020_4080) >> 56;
-    falls.par_chunks_mut(h).enumerate().for_each(|(s, col)| {
-        let (kw, sh) = (s >> 3, (s & 7) * 8);
-        // Cells of the row below that are certain to move away.
-        let mut below = 0u64;
-        for y in (0..h).rev() {
-            let (mut fword, mut mword) = (0u64, 0u64);
-            let mut bits = (cand[y * wpr + kw].load(Ordering::Relaxed) >> sh) & 0xff;
-            let cur = &src[y * w..(y + 1) * w];
-            let bottom = y + 1 == h;
-            let dn = if bottom { cur } else { &src[(y + 1) * w..(y + 2) * w] };
-            let hs = mix(seed, y as u32);
-            while bits != 0 {
-                let i = bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let x = (s * 8 + i) * 8;
-                if x >= w {
-                    continue;
-                }
-                let lane = (below >> (i * 8)) & 0xff;
-                let (mut f, mut m) = (0u64, 0u64);
-                if bottom {
-                    for l in 0..(w - x).min(8) {
-                        if is_sand(cur[x + l]) {
-                            m |= 1 << l; // swept off the grid
-                        }
-                    }
-                } else if x >= 1 && x + 9 <= w {
-                    let sand = mask8(sandm(rd(cur, x)));
-                    let fall = sand & (mask8(!nz(rd(dn, x))) | lane);
-                    let free = mask8(!nz(rd(dn, x - 1))) | mask8(!nz(rd(dn, x + 1)));
-                    let mut cand = sand & !fall & free;
-                    let mut slide = 0u64;
-                    while cand != 0 {
-                        let l = cand.trailing_zeros() as usize;
-                        cand &= cand - 1;
-                        if slide_ok(cur, dn, x + l, hs) {
-                            slide |= 1 << l;
-                        }
-                    }
-                    f = fall;
-                    m = fall | slide;
-                } else {
-                    for l in 0..(w - x).min(8) {
-                        if !is_sand(cur[x + l]) {
-                            continue;
-                        }
-                        if dn[x + l] == 0 || (lane >> l) & 1 != 0 {
-                            f |= 1 << l;
-                            m |= 1 << l;
-                        } else if slide_ok(cur, dn, x + l, hs) {
-                            m |= 1 << l;
-                        }
-                    }
-                }
-                fword |= f << (i * 8);
-                mword |= m << (i * 8);
-            }
-            col[y] = fword;
-            below = mword;
-        }
-    });
-}
-
-/// The grain at `x` (not falling) is certain to slide diagonally: it has a free
-/// lower diagonal and nothing can contest the target, neither a grain directly
-/// above the target nor one that would slide in from the other side.
+/// Xorshift coin flip.
 #[inline(always)]
-fn slide_ok(cur: &[u8], dn: &[u8], x: usize, hs: u32) -> bool {
-    let w = cur.len();
-    let left = x > 0 && dn[x - 1] == 0;
-    let right = x + 1 < w && dn[x + 1] == 0;
-    let go_left = match (left, right) {
-        (true, true) => (mix(x as u32, hs) >> 16) & 1 == 0,
-        (true, false) => true,
-        (false, true) => false,
-        (false, false) => return false,
-    };
-    if go_left {
-        !is_sand(cur[x - 1]) && (x < 2 || !is_sand(cur[x - 2]))
-    } else {
-        !is_sand(cur[x + 1]) && (x + 2 >= w || !is_sand(cur[x + 2]))
-    }
+fn flip(s: &mut u64) -> bool {
+    *s ^= *s << 13;
+    *s ^= *s >> 7;
+    *s ^= *s << 17;
+    *s & 1 == 1
 }
 
-/// Where the grain at `x` would like to go, ignoring competition.
-#[inline(always)]
-fn want(cur: &[u8], dn: &[u8], m: FallRow, x: usize, hs: u32) -> Dir {
-    if !is_sand(cur[x]) {
-        return Dir::Stay;
-    }
-    if m.get(x) {
-        return Dir::Down;
-    }
-    let left = x > 0 && dn[x - 1] == 0;
-    let right = x + 1 < dn.len() && dn[x + 1] == 0;
-    match (left, right) {
-        (true, true) => {
-            if (mix(x as u32, hs) >> 16) & 1 == 0 {
-                Dir::Left
-            } else {
-                Dir::Right
-            }
+/// Move grains of `top` into `bot` (the row below). Returns whether any grain
+/// stayed in `top`, and whether any landed in `bot`.
+fn move_row(top: &mut [u8], bot: &mut [u8], rev: bool, rng: &mut u64) -> (bool, bool) {
+    let n = top.len();
+    let (mut stay, mut land) = (false, false);
+    let chunks = n.div_ceil(8);
+    for ci in 0..chunks {
+        let c = if rev { chunks - 1 - ci } else { ci };
+        let a = c * 8;
+        let e = (a + 8).min(n);
+        if e - a == 8 && sandm(rd(&top[a..e])) == 0 {
+            continue;
         }
-        (true, false) => Dir::Left,
-        (false, true) => Dir::Right,
-        (false, false) => Dir::Stay,
-    }
-}
-
-/// Where the grain at `x` actually goes after losing to any competitor.
-#[inline(always)]
-fn resolve(cur: &[u8], dn: &[u8], m: FallRow, x: usize, hs: u32) -> Dir {
-    match want(cur, dn, m, x, hs) {
-        Dir::Left => {
-            let tx = x - 1;
-            if is_sand(cur[tx]) {
-                return Dir::Stay; // the grain above the target falls straight in
-            }
-            if x >= 2
-                && want(cur, dn, m, x - 2, hs) == Dir::Right
-                && (mix(tx as u32, hs ^ TIE) >> 16) & 1 == 0
-            {
-                return Dir::Stay; // tie: bit 0 favours the grain from the left
-            }
-            Dir::Left
-        }
-        Dir::Right => {
-            let tx = x + 1;
-            if is_sand(cur[tx]) {
-                return Dir::Stay;
-            }
-            if tx + 1 < cur.len()
-                && want(cur, dn, m, tx + 1, hs) == Dir::Left
-                && (mix(tx as u32, hs ^ TIE) >> 16) & 1 == 1
-            {
-                return Dir::Stay; // tie: bit 1 favours the grain from the right
-            }
-            Dir::Right
-        }
-        d => d,
-    }
-}
-
-/// The grain arriving at cell `x` of `cur` (the row below `up`), or 0. `mu` is
-/// the fall bitmap of `up`. Diagonal arrivals only happen into empty cells.
-#[inline(always)]
-fn incoming(up: &[u8], cur: &[u8], mu: FallRow, x: usize, hs_up: u32) -> u8 {
-    let a = up[x];
-    if is_sand(a) && mu.get(x) {
-        return a;
-    }
-    if cur[x] != 0 {
-        return 0;
-    }
-    if x > 0 {
-        let l = up[x - 1];
-        if is_sand(l) && resolve(up, cur, mu, x - 1, hs_up) == Dir::Right {
-            return l;
-        }
-    }
-    if x + 1 < up.len() {
-        let r = up[x + 1];
-        if is_sand(r) && resolve(up, cur, mu, x + 1, hs_up) == Dir::Left {
-            return r;
-        }
-    }
-    0
-}
-
-fn process_row(
-    r: &Row,
-    out: &mut [u8],
-    dirty: &mut [u64],
-    cand_cur: &[AtomicU64],
-    cand_next: &[AtomicU64],
-    wpr: usize,
-) {
-    let Row { up, cur, dn, mc, mu, hs_up, hs, y, h, nc } = *r;
-    let w = cur.len();
-    let bottom = y + 1 == h;
-    let rd = |r: &[u8], i: usize| u64::from_le_bytes(r[i..i + 8].try_into().unwrap());
-    // High bit of each byte set for sand / for any non-empty cell.
-    let sandm = |v: u64| (((v & LOW7).wrapping_add(LOW7)) & !v) & HIGH;
-    let nz = |v: u64| (((v & LOW7).wrapping_add(LOW7)) | v) & HIGH;
-
-    for k in 0..wpr {
-        let was_dirty = dirty[k];
-        let mut visit = cand_cur[k].swap(0, Ordering::Relaxed) | was_dirty;
-        let mut now_dirty = 0u64;
-        while visit != 0 {
-            let b = visit.trailing_zeros() as usize;
-            visit &= visit - 1;
-            let ci = k * 64 + b;
-            let x = ci * CHUNK;
-            if x >= w {
+        for k in 0..e - a {
+            let x = if rev { e - 1 - k } else { a + k };
+            let v = top[x];
+            if !is_sand(v) {
                 continue;
             }
-            let end = (x + CHUNK).min(w);
-
-            let mut skip = false;
-            let mut had_sand = false;
-            if x >= 1 && x + 9 <= w {
-                let cu = rd(cur, x);
-                let sand_c = sandm(cu);
-                let sand_u = sandm(rd(up, x)) | sandm(rd(up, x - 1)) | sandm(rd(up, x + 1));
-                if sand_c | sand_u == 0 {
-                    // Nothing here and nothing arriving: the chunk is unchanged.
-                    skip = true;
-                } else if !bottom && nz(cu) == HIGH {
-                    // No empty cell to receive anything and every grain is fully
-                    // supported (straight down and both diagonals occupied).
-                    let blocked = nz(rd(dn, x)) & nz(rd(dn, x - 1)) & nz(rd(dn, x + 1));
-                    skip = mc.chunk(ci) == 0 && sand_c & !blocked == 0;
-                    had_sand = true;
-                }
-            }
-
-            let has_sand;
-            if skip {
-                // Unchanged by this step; only repair a stale back buffer.
-                if was_dirty >> b & 1 != 0 {
-                    out[x..end].copy_from_slice(&cur[x..end]);
-                }
-                has_sand = had_sand;
+            let t = if bot[x] == 0 {
+                x
             } else {
-                now_dirty |= 1u64 << b;
-                out[x..end].copy_from_slice(&cur[x..end]);
-                for i in x..end {
-                    let c = cur[i];
-                    if c == 0 {
-                        let g = incoming(up, cur, mu, i, hs_up);
-                        if g != 0 {
-                            out[i] = g;
-                        }
-                    } else if c < OBSTACLE_BASE {
-                        // The grain leaves (falls, slides, or is swept off the
-                        // bottom); the grain above may drop into its place.
-                        if bottom || resolve(cur, dn, mc, i, hs) != Dir::Stay {
-                            let a = up[i];
-                            out[i] = if is_sand(a) && mu.get(i) { a } else { 0 };
+                let l = x > 0 && bot[x - 1] == 0;
+                let r = x + 1 < n && bot[x + 1] == 0;
+                match (l, r) {
+                    (true, true) => {
+                        if flip(rng) {
+                            x - 1
+                        } else {
+                            x + 1
                         }
                     }
+                    (true, false) => x - 1,
+                    (false, true) => x + 1,
+                    _ => {
+                        stay = true;
+                        continue;
+                    }
                 }
-                has_sand = out[x..end].iter().any(|&c| is_sand(c));
-            }
-            if has_sand {
-                mark_candidates(cand_next, wpr, nc, h, y, ci);
+            };
+            bot[t] = v;
+            top[x] = 0;
+            land = true;
+        }
+    }
+    (stay, land)
+}
+
+/// Raw pointer to the grid, shared by the strips. Each strip only touches its
+/// own columns.
+struct Grid(*mut u8);
+unsafe impl Send for Grid {}
+unsafe impl Sync for Grid {}
+
+/// Bottom-up scan of columns `x0..x1`. Returns which rows hold sand afterwards.
+fn sweep(grid: &Grid, rows: &[u8], w: usize, x0: usize, x1: usize, seed: u64, odd: bool) -> Vec<u8> {
+    let h = rows.len();
+    let mut out = vec![0u8; h];
+    let mut rng = seed | 1;
+    for y in (0..h - 1).rev() {
+        if rows[y] == 0 {
+            continue;
+        }
+        // SAFETY: strips cover disjoint column ranges, and the two slices
+        // are different rows, so nothing else aliases these bytes.
+        let (top, bot) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(grid.0.add(y * w + x0), x1 - x0),
+                std::slice::from_raw_parts_mut(grid.0.add((y + 1) * w + x0), x1 - x0),
+            )
+        };
+        let rev = (y & 1 == 1) == odd;
+        let (stay, land) = move_row(top, bot, rev, &mut rng);
+        out[y] |= stay as u8;
+        out[y + 1] |= land as u8;
+    }
+    out
+}
+
+/// One simulation step; `bits` supplies the random strip boundaries.
+pub(crate) fn step(cells: &mut [u8], rows: &[AtomicU8], w: usize, h: usize, bits: u32) {
+    // Sand reaching the bottom disappears.
+    if rows[h - 1].load(Relaxed) != 0 {
+        for c in &mut cells[(h - 1) * w..] {
+            if is_sand(*c) {
+                *c = 0;
             }
         }
-        dirty[k] = now_dirty;
+        rows[h - 1].store(0, Relaxed);
+    }
+    let cur: Vec<u8> = rows.iter().map(|r| r.load(Relaxed)).collect();
+
+    let mut edges = vec![0];
+    let mut x = bits as usize % STRIP;
+    if x == 0 {
+        x = STRIP;
+    }
+    while x < w {
+        edges.push(x);
+        x += STRIP;
+    }
+    edges.push(w);
+
+    let grid = Grid(cells.as_mut_ptr());
+    let grid = &grid;
+    let base = (bits as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let odd = FRAME.fetch_add(1, Relaxed) & 1 == 1;
+    let outs: Vec<Vec<u8>> = (0..edges.len() - 1)
+        .into_par_iter()
+        .map(|k| {
+            let seed = base ^ (k as u64 + 1).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            sweep(grid, &cur, w, edges[k], edges[k + 1], seed, odd)
+        })
+        .collect();
+    for (y, r) in rows.iter().enumerate() {
+        r.store(outs.iter().any(|o| o[y] != 0) as u8, Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reference as r;
+
+    fn flags(h: usize, v: u8) -> Vec<AtomicU8> {
+        (0..h).map(|_| AtomicU8::new(v)).collect()
+    }
+
+    #[test]
+    fn block_picture() {
+        let mut rng = Rng::seeded(1);
+        let mut cells = r::scene();
+        let rows = flags(r::H, 0);
+        let mut grains = Vec::new();
+        for f in 0..2500 {
+            r::emit(&mut cells, &mut rng, f);
+            rows[0].store(1, Relaxed);
+            step(&mut cells, &rows, r::W, r::H, rng.next_u32());
+            if f % 500 == 499 {
+                grains.push(cells.iter().filter(|&&v| is_sand(v)).count());
+            }
+        }
+        r::write_png("target/new.png", r::W, r::H, &r::render(&cells));
+        println!("NEW grains {grains:?}\n{}", r::ascii(&cells, r::W, r::H, 4, 6));
+    }
+
+    #[test]
+    fn conserves_sand() {
+        let (w, h) = (203, 101);
+        let mut rng = Rng::seeded(7);
+        let mut cells = vec![0u8; w * h];
+        for c in &mut cells[(h - 1) * w..] {
+            *c = 200;
+        }
+        for i in 0..w * (h - 1) {
+            if rng.f32() < 0.2 {
+                cells[i] = 1 + rng.below(100) as u8;
+            }
+        }
+        let rows = flags(h, 1);
+        let count = |c: &[u8]| c.iter().filter(|&&v| is_sand(v)).count();
+        let n0 = count(&cells);
+        for f in 0..400 {
+            step(&mut cells, &rows, w, h, rng.next_u32());
+            assert_eq!(count(&cells), n0, "step {f}");
+        }
+    }
+
+    #[test]
+    fn world_picture() {
+        let mut world = World::new(1280, 720);
+        for f in 1..=1800 {
+            world.update(1.0 / 60.0);
+            if f % 600 == 0 {
+                r::write_png(&format!("target/world_{f}.png"), 1280, 720, &r::render(&world.cells));
+            }
+        }
+        println!("WORLD\n{}", r::ascii(&world.cells, 1280, 720, 8, 12));
+    }
+
+    #[test]
+    fn bench_4k() {
+        let mut world = World::new(3840, 2160);
+        for _ in 0..600 {
+            world.update(1.0 / 60.0);
+        }
+        let t = std::time::Instant::now();
+        for _ in 0..300 {
+            world.update(1.0 / 60.0);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1000.0 / 300.0;
+        let sand = world.cells.iter().filter(|&&v| is_sand(v)).count();
+        println!("4K: {ms:.2} ms/frame, {sand} grains");
     }
 }
