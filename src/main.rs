@@ -1,10 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod gfx;
+mod menu;
 mod rng;
 #[cfg(test)]
 mod reference;
+mod settings;
 mod sim;
+mod ui;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -12,12 +15,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition};
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key as WKey, NamedKey};
 use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 use gfx::Gfx;
+use menu::Menu;
+use settings::{Settings, Store};
 use sim::{World, OBSTACLE_BASE, SAND_COLORS};
 
 /// Simulation rate. Presentation is vsynced; the sim advances at a fixed 60 Hz.
@@ -27,7 +33,7 @@ const MAX_INFLIGHT: usize = 4;
 /// Integer resolution divider: the simulation grid is the screen resolution
 /// divided by this (1 = full resolution, 2 = half, 3 = a third, ...). Each
 /// cell is drawn as a SCALE x SCALE block of pixels.
-const SCALE: u32 = 4;
+const SCALE: u32 = 3;
 const _: () = assert!(SCALE >= 1);
 /// Input is ignored briefly after startup so launch-time key/mouse events don't exit immediately.
 const INPUT_GRACE: Duration = Duration::from_millis(1500);
@@ -48,11 +54,6 @@ fn hsv(h: f32, s: f32, v: f32) -> u32 {
     let to8 = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u32;
     (to8(r) << 16) | (to8(g) << 8) | to8(b)
 }
-
-/// Sand palette lightness and chroma (OKLCH). Equal for every hue, and low
-/// enough that all hues fit inside sRGB.
-const SAND_LIGHTNESS: f32 = 0.80;
-const SAND_CHROMA: f32 = 0.11;
 
 /// OKLCH to packed sRGB. Out-of-gamut colours are brought in by reducing
 /// the chroma, which keeps lightness and hue.
@@ -93,12 +94,22 @@ fn oklch(l: f32, c: f32, h_deg: f32) -> u32 {
     (encode(r) << 16) | (encode(g) << 8) | encode(b)
 }
 
-fn build_lut() -> [u32; 256] {
+/// Palette: sand colors cycle around `hue_span` degrees from `hue_start`. A
+/// range narrower than the whole wheel goes there and back so that the cycle
+/// stays seamless.
+fn build_lut(s: &Settings) -> [u32; 256] {
     let mut lut = [0u32; 256];
     lut[0] = 0x0A0B12;
     for i in 1..=SAND_COLORS as usize {
-        let hue = (i - 1) as f32 / SAND_COLORS as f32 * 360.0;
-        lut[i] = oklch(SAND_LIGHTNESS, SAND_CHROMA, hue);
+        let t = (i - 1) as f32 / SAND_COLORS as f32;
+        let along = if s.hue_span >= 359.5 {
+            t
+        } else if t < 0.5 {
+            2.0 * t
+        } else {
+            2.0 - 2.0 * t
+        };
+        lut[i] = oklch(s.sand_lightness, s.sand_chroma, s.hue_start + s.hue_span * along);
     }
     for id in OBSTACLE_BASE as usize..256 {
         let hue = 200.0 + ((id * 37) % 60) as f32;
@@ -110,10 +121,18 @@ fn build_lut() -> [u32; 256] {
 
 /// Runs the simulation on a background thread so it overlaps with rendering.
 /// Finished frames come back as snapshots of the cell grid.
+enum Msg {
+    /// Advance the simulation this many steps and send back a snapshot.
+    Steps(usize),
+    Settings(Settings),
+    /// Start over with a fresh world.
+    Restart,
+}
+
 struct SimThread {
     w: usize,
     h: usize,
-    cmd: Sender<usize>,
+    cmd: Sender<Msg>,
     frames: Receiver<(Vec<u8>, usize)>,
     recycle: Sender<Vec<u8>>,
     /// Steps requested but not yet returned.
@@ -121,13 +140,26 @@ struct SimThread {
 }
 
 impl SimThread {
-    fn new(w: usize, h: usize) -> Self {
-        let (cmd, cmd_rx) = mpsc::channel::<usize>();
+    fn new(w: usize, h: usize, settings: Settings) -> Self {
+        let (cmd, cmd_rx) = mpsc::channel::<Msg>();
         let (frames_tx, frames) = mpsc::channel::<(Vec<u8>, usize)>();
         let (recycle, recycle_rx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
-            let mut world = World::new(w, h);
-            while let Ok(steps) = cmd_rx.recv() {
+            let mut settings = settings;
+            let mut world = World::new(w, h, settings);
+            while let Ok(msg) = cmd_rx.recv() {
+                let steps = match msg {
+                    Msg::Steps(n) => n,
+                    Msg::Settings(s) => {
+                        settings = s;
+                        world.apply_settings(s);
+                        0
+                    }
+                    Msg::Restart => {
+                        world = World::new(w, h, settings);
+                        0
+                    }
+                };
                 for _ in 0..steps {
                     world.update(STEP);
                 }
@@ -150,10 +182,39 @@ impl SimThread {
     }
 
     fn run(&mut self, steps: usize) {
-        if self.cmd.send(steps).is_ok() {
+        if self.cmd.send(Msg::Steps(steps)).is_ok() {
             self.inflight += steps;
         }
     }
+
+    /// Tell the sim thread something other than "step"; it answers with a
+    /// snapshot of zero steps.
+    fn send(&self, msg: Msg) {
+        let _ = self.cmd.send(msg);
+    }
+}
+
+/// Panel pixel size for a window this tall.
+fn ui_scale(height: u32) -> u32 {
+    ((height as f32 / 360.0).round() as u32).clamp(1, 6)
+}
+
+fn translate(event: &KeyEvent) -> Option<menu::Key> {
+    use menu::Key;
+    if let WKey::Named(n) = &event.logical_key {
+        match n {
+            NamedKey::ArrowUp => return Some(Key::Up),
+            NamedKey::ArrowDown => return Some(Key::Down),
+            NamedKey::ArrowLeft => return Some(Key::Left),
+            NamedKey::ArrowRight => return Some(Key::Right),
+            NamedKey::Enter => return Some(Key::Enter),
+            NamedKey::Escape => return Some(Key::Esc),
+            NamedKey::Backspace => return Some(Key::Backspace),
+            NamedKey::Tab => return Some(Key::Tab),
+            _ => {}
+        }
+    }
+    event.text.as_ref().and_then(|t| t.chars().find(|c| !c.is_control())).map(Key::Char)
 }
 
 struct App {
@@ -164,10 +225,19 @@ struct App {
     started: Instant,
     accumulator: f32,
     mouse_origin: Option<PhysicalPosition<f64>>,
+    settings: Settings,
+    /// Present in settings mode only.
+    menu: Option<Menu>,
+    shift: bool,
+    /// The menu image must be redrawn (it changed, or the window did).
+    overlay_dirty: bool,
+    overlay_for: (u32, u32),
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(configure: bool) -> Self {
+        let store = Store::system();
+        let settings = store.load_settings();
         App {
             window: None,
             gfx: None,
@@ -176,6 +246,54 @@ impl App {
             started: Instant::now(),
             accumulator: 0.0,
             mouse_origin: None,
+            settings,
+            menu: configure.then(|| Menu::new(settings, store)),
+            shift: false,
+            overlay_dirty: true,
+            overlay_for: (0, 0),
+        }
+    }
+
+    /// React to what a menu key press asked for.
+    fn apply(&mut self, event_loop: &ActiveEventLoop, fx: menu::Effect) {
+        self.overlay_dirty = true;
+        if fx.quit {
+            if let Some(menu) = &self.menu {
+                menu.save();
+            }
+            event_loop.exit();
+            return;
+        }
+        if fx.changed {
+            if let Some(menu) = &self.menu {
+                self.settings = menu.settings;
+            }
+            if let Some(sim) = &self.sim {
+                sim.send(Msg::Settings(self.settings));
+            }
+            if let Some(gfx) = &self.gfx {
+                gfx.set_lut(&build_lut(&self.settings));
+            }
+        }
+        if fx.restart {
+            if let Some(sim) = &self.sim {
+                sim.send(Msg::Restart);
+            }
+        }
+    }
+
+    fn config_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.apply(event_loop, menu::Effect { quit: true, ..Default::default() }),
+            WindowEvent::ModifiersChanged(m) => self.shift = m.state().shift_key(),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let (Some(key), Some(menu)) = (translate(&event), &mut self.menu) {
+                    let fx = menu.key(key, self.shift);
+                    self.apply(event_loop, fx);
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw(),
+            _ => {}
         }
     }
 
@@ -190,10 +308,22 @@ impl App {
         if gfx.size() != (size.width, size.height) {
             gfx.resize(size.width, size.height);
         }
+        if let Some(menu) = &self.menu {
+            if self.overlay_dirty || self.overlay_for != (size.width, size.height) {
+                if menu.visible {
+                    let img = ui::render(&menu.view(), ui_scale(size.height), size.height);
+                    gfx.set_overlay(Some((img.w, img.h, &img.rgba)));
+                } else {
+                    gfx.set_overlay(None);
+                }
+                self.overlay_dirty = false;
+                self.overlay_for = (size.width, size.height);
+            }
+        }
         let (cw, ch) = gfx.cell_size();
         let (w, h) = (cw as usize, ch as usize);
         if self.sim.as_ref().map_or(true, |s| s.w != w || s.h != h) {
-            self.sim = Some(SimThread::new(w, h));
+            self.sim = Some(SimThread::new(w, h, self.settings));
             self.accumulator = STEP; // kick off the first step immediately
         }
         let sim = self.sim.as_mut().unwrap();
@@ -234,21 +364,31 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("Falling Sand")
-            .with_decorations(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
+        let configure = self.menu.is_some();
+        let attrs = Window::default_attributes();
+        let attrs = if configure {
+            attrs.with_title("Falling Sand Settings").with_inner_size(LogicalSize::new(1280.0, 720.0))
+        } else {
+            attrs
+                .with_title("Falling Sand")
+                .with_decorations(false)
+                .with_window_level(WindowLevel::AlwaysOnTop)
+                .with_fullscreen(Some(Fullscreen::Borderless(None)))
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("failed to create window"));
-        window.set_cursor_visible(false);
+        window.set_cursor_visible(configure);
 
-        self.gfx = Some(pollster::block_on(Gfx::new(window.clone(), &build_lut(), SCALE)));
+        self.gfx = Some(pollster::block_on(Gfx::new(window.clone(), &build_lut(&self.settings), SCALE)));
         self.window = Some(window);
         self.last_tick = Instant::now();
         self.started = Instant::now();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if self.menu.is_some() {
+            self.config_event(event_loop, event);
+            return;
+        }
         let armed = self.started.elapsed() >= INPUT_GRACE;
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -282,13 +422,15 @@ impl ApplicationHandler for App {
 
 fn main() {
     // Windows screensaver protocol: /s = run, /c = configure, /p = preview.
+    let mut configure = false;
     if let Some(arg) = std::env::args().nth(1) {
         let mode = arg.trim_start_matches(['/', '-']).to_lowercase();
-        if mode.starts_with('c') || mode.starts_with('p') {
+        if mode.starts_with('p') {
             return;
         }
+        configure = mode.starts_with('c');
     }
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    event_loop.run_app(&mut App::new()).expect("event loop error");
+    event_loop.run_app(&mut App::new(configure)).expect("event loop error");
 }

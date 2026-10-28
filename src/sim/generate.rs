@@ -97,8 +97,8 @@ fn outflow(o: &Obstacle, x: f32, y: f32, k: f32) -> Vec<(f32, f32, f32, f32)> {
 }
 
 /// Width of stream `i` together with the streams touching it, relative to
-/// `WIDE_STREAM`.
-fn wideness(flows: &[Flow], i: usize, k: f32) -> f32 {
+/// `wide` (in pixels at 1080p).
+fn wideness(flows: &[Flow], i: usize, k: f32, wide: f32) -> f32 {
     let f = &flows[i];
     let (mut lo, mut hi) = (f.x - f.width / 2.0, f.x + f.width / 2.0);
     for (j, g) in flows.iter().enumerate() {
@@ -107,7 +107,7 @@ fn wideness(flows: &[Flow], i: usize, k: f32) -> f32 {
             hi = hi.max(g.x + g.width / 2.0);
         }
     }
-    (hi - lo) / (WIDE_STREAM * k)
+    (hi - lo) / (wide * k)
 }
 
 /// How many other streams are close to stream `i`.
@@ -193,7 +193,7 @@ impl World {
 
     /// Whether a rule applies this time, given how strongly it is wanted.
     fn guided(&mut self, influence: f32) -> bool {
-        self.rng.chance(influence * (1.0 - WEIRD_PLACEMENT))
+        self.rng.chance(influence * (1.0 - self.s.weird_placement))
     }
 
     fn weighted(&mut self, w: &[f32]) -> Option<usize> {
@@ -238,12 +238,12 @@ impl World {
         let mut x = self.rng.range(margin, w - margin);
         for _ in 0..8 {
             x = self.rng.range(margin, w - margin);
-            if self.guided(OBSTACLES_ATTRACT_STREAMS) {
+            if self.guided(self.s.obstacles_attract_streams) {
                 if let Some(v) = self.sky_above_obstacle() {
                     x = v.clamp(margin, w - margin);
                 }
             }
-            if !self.is_loop(x, 0.0) || self.rng.chance(WEIRD_LOOPS) {
+            if !self.is_loop(x, 0.0) || self.rng.chance(self.s.weird_loops) {
                 break;
             }
         }
@@ -298,12 +298,13 @@ impl World {
 
     fn pick_kind(&mut self, flows: &[Flow]) -> Pick {
         let (k, h) = (self.unit, self.h as f32);
-        let att = STREAMS_ATTRACT_OBSTACLES * (1.0 - WEIRD_KIND);
+        let s = self.s;
+        let att = s.streams_attract_obstacles * (1.0 - s.weird_kind);
         let usable: Vec<usize> = (0..flows.len()).filter(|&i| flows[i].y < h * 0.8).collect();
         let b = |on: bool| if on { 1.0 } else { 0.0 };
         let free = usable.iter().any(|&i| flows[i].hit.is_none());
         let hit = usable.iter().any(|&i| flows[i].hit.is_some());
-        let wide = usable.iter().any(|&i| wideness(flows, i, k) > 1.0);
+        let wide = usable.iter().any(|&i| wideness(flows, i, k, s.wide_stream) > 1.0);
         let crowded = usable.iter().any(|&i| crowd(flows, i, k) >= 1);
         let cuttable = self.obstacles.iter().any(|o| o.is_live() && o.holes.len() < 3);
         let thick = self
@@ -311,22 +312,22 @@ impl World {
             .iter()
             .any(|o| o.is_live() && o.holes.len() < 3 && o.shape.thickness() >= 14.0 * k);
         let mut weights = [
-            SLOPE_WEIGHT * (1.0 + 2.0 * att * b(free)),
-            DIAMOND_WEIGHT * (1.0 + 2.5 * att * b(wide)),
-            CIRCLE_WEIGHT * (1.0 + 2.5 * att * b(wide)),
-            FUNNEL_WEIGHT * (1.0 + 3.0 * att * b(crowded)),
-            if cuttable { LONG_HOLE_WEIGHT * (1.0 + 1.5 * att * b(hit)) } else { 0.0 },
-            if thick { CIRCLE_HOLE_WEIGHT * (1.0 + 1.5 * att * b(hit)) } else { 0.0 },
+            s.slope_weight * (1.0 + 2.0 * att * b(free)),
+            s.diamond_weight * (1.0 + 2.5 * att * b(wide)),
+            s.circle_weight * (1.0 + 2.5 * att * b(wide)),
+            s.funnel_weight * (1.0 + 3.0 * att * b(crowded)),
+            if cuttable { s.long_hole_weight * (1.0 + 1.5 * att * b(hit)) } else { 0.0 },
+            if thick { s.circle_hole_weight * (1.0 + 1.5 * att * b(hit)) } else { 0.0 },
         ];
-        if self.rng.chance(WEIRD_KIND * 0.5) {
+        if self.rng.chance(s.weird_kind * 0.5) {
             // Ignore the situation altogether.
             weights = [
-                SLOPE_WEIGHT,
-                DIAMOND_WEIGHT,
-                CIRCLE_WEIGHT,
-                FUNNEL_WEIGHT,
-                if cuttable { LONG_HOLE_WEIGHT } else { 0.0 },
-                if thick { CIRCLE_HOLE_WEIGHT } else { 0.0 },
+                s.slope_weight,
+                s.diamond_weight,
+                s.circle_weight,
+                s.funnel_weight,
+                if cuttable { s.long_hole_weight } else { 0.0 },
+                if thick { s.circle_hole_weight } else { 0.0 },
             ];
         }
         let kinds = [
@@ -341,9 +342,9 @@ impl World {
     }
 
     fn spawn_solid(&mut self, pick: Pick, flows: &[Flow]) {
-        let loops_ok = self.rng.chance(WEIRD_LOOPS);
-        let overlap_ok = self.rng.chance(WEIRD_OVERLAP);
-        let chaining = self.rng.chance(OBSTACLE_CHAINING);
+        let loops_ok = self.rng.chance(self.s.weird_loops);
+        let overlap_ok = self.rng.chance(self.s.weird_overlap);
+        let chaining = self.rng.chance(self.s.obstacle_chaining);
         let mut best: Option<(f32, Cand)> = None;
         let mut valid = 0;
         for _ in 0..40 {
@@ -370,7 +371,7 @@ impl World {
             }
         }
         if let Some((_, c)) = best {
-            let life = vary(&mut self.rng, OBSTACLE_DURATION, OBSTACLE_DURATION_VARIANCE).max(1.0);
+            let life = vary(&mut self.rng, self.s.obstacle_duration, self.s.obstacle_duration_variance).max(1.0);
             for (i, p) in c.pieces.into_iter().enumerate() {
                 let id = self.free_ids.pop().unwrap();
                 let mut o = Obstacle::new(p.shape, p.cx, p.cy, id, life, self.fall);
@@ -391,7 +392,7 @@ impl World {
     fn overlaps(&self, p: &Piece) -> bool {
         let (ex, ey) = p.shape.extent();
         let step = (5.0 * self.unit).max(3.0);
-        let pad = OBSTACLE_CLEARANCE * self.unit;
+        let pad = self.s.obstacle_clearance * self.unit;
         let offsets = [(0.0, 0.0), (pad, 0.0), (-pad, 0.0), (0.0, pad), (0.0, -pad)];
         for o in &self.obstacles {
             if !o.is_live() || (o.cx - p.cx).abs() > o.ex + ex + pad || (o.cy - p.cy).abs() > o.ey + ey + pad {
@@ -453,7 +454,7 @@ impl World {
 
     /// A stream to build under, and the height to build at.
     fn target_flow(&mut self, flows: &[Flow]) -> Option<(usize, f32)> {
-        if !self.guided(STREAMS_ATTRACT_OBSTACLES) {
+        if !self.guided(self.s.streams_attract_obstacles) {
             return None;
         }
         let i = self.pick_flow(flows, |_, _| 1.0)?;
@@ -473,7 +474,7 @@ impl World {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
         let hl = self.rng.range(110.0, 260.0) * k;
         let ht = self.rng.range(5.0, 9.0) * k;
-        let (lo, hi) = if self.rng.chance(WEIRD_SHAPE) { (8.0, 80.0) } else { (31.0, 59.0) };
+        let (lo, hi) = if self.rng.chance(self.s.weird_shape) { (8.0, 80.0) } else { (31.0, 59.0) };
         let mag = self.rng.range(lo, hi).to_radians();
         let (cos, sin) = (mag.cos(), mag.sin());
         // `dd` is the way the slope goes down: 1 is to the right.
@@ -481,10 +482,10 @@ impl World {
             let f = &flows[i];
             // Redirect the stream backwards compared to how it arrived.
             let mut dd = if f.dir != 0.0 { -f.dir } else { self.rng.sign() };
-            if self.rng.chance(WEIRD_REDIRECT) {
+            if self.rng.chance(self.s.weird_redirect) {
                 dd = -dd;
             }
-            let (x_land, frac) = if wideness(flows, i, k) > 1.0 && self.rng.chance(0.5) {
+            let (x_land, frac) = if wideness(flows, i, k, self.s.wide_stream) > 1.0 && self.rng.chance(0.5) {
                 // Sit at the edge of a wide stream and split it.
                 dd = self.rng.sign();
                 (f.x + dd * f.width * 0.3, self.rng.range(0.0, 0.1))
@@ -510,7 +511,7 @@ impl World {
     fn diamond_candidate(&mut self, flows: &[Flow]) -> Option<Cand> {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
         let q = self.rng.range(30.0, 75.0) * k;
-        let (lo, hi) = if self.rng.chance(WEIRD_SHAPE) { (2.0, 88.0) } else { (31.0, 59.0) };
+        let (lo, hi) = if self.rng.chance(self.s.weird_shape) { (2.0, 88.0) } else { (31.0, 59.0) };
         let theta = self.rng.sign() * self.rng.range(lo, hi).to_radians();
         let shape = Shape::new(Kind::Rect { hl: q, ht: q }, theta);
         let (_, ey) = shape.extent();
@@ -519,7 +520,7 @@ impl World {
         let corner = q * (c.signum() * s - s.signum() * c);
         let (x_land, y_land) = if let Some((i, y_land)) = self.target_flow(flows) {
             let f = &flows[i];
-            let jitter = if wideness(flows, i, k) > 1.0 {
+            let jitter = if wideness(flows, i, k, self.s.wide_stream) > 1.0 {
                 self.rng.range(-0.1, 0.1) * f.width
             } else {
                 self.rng.range(-0.8, 0.8) * q
@@ -543,7 +544,7 @@ impl World {
         let r = self.rng.range(35.0, 95.0) * k;
         let (x_land, y_land) = if let Some((i, y_land)) = self.target_flow(flows) {
             let f = &flows[i];
-            let jitter = if wideness(flows, i, k) > 1.0 {
+            let jitter = if wideness(flows, i, k, self.s.wide_stream) > 1.0 {
                 self.rng.range(-0.1, 0.1) * f.width
             } else {
                 self.rng.range(-0.6, 0.6) * r
@@ -570,7 +571,7 @@ impl World {
         } else {
             self.rng.range(14.0, 70.0)
         } * k;
-        let weird = self.rng.chance(WEIRD_SHAPE);
+        let weird = self.rng.chance(self.s.weird_shape);
         let a_l = self.funnel_angle(weird);
         let a_r = if weird && self.rng.chance(0.5) { self.funnel_angle(true) } else { a_l };
         let off = if self.rng.chance(0.7) {
@@ -580,7 +581,7 @@ impl World {
         } * k;
 
         // Gather streams that are close together.
-        let picked = if self.guided(STREAMS_ATTRACT_OBSTACLES) {
+        let picked = if self.guided(self.s.streams_attract_obstacles) {
             self.pick_flow(flows, |i, _| 1.0 + 2.0 * crowd(flows, i, k) as f32)
         } else {
             None
@@ -660,7 +661,7 @@ impl World {
         // Under a stream if possible, so it falls through.
         let mut target = None;
         let mut x = 0.0;
-        if self.guided(STREAMS_ATTRACT_OBSTACLES) {
+        if self.guided(self.s.streams_attract_obstacles) {
             let ids: Vec<u8> = ok.iter().map(|&i| self.obstacles[i].id).collect();
             let jitter = self.rng.range(-0.3, 0.3);
             let own = |f: &Flow| f.hit.map_or(false, |(id, _)| ids.contains(&id));
@@ -687,7 +688,7 @@ impl World {
         };
         let thickness = o.shape.thickness();
         let span = bot - top;
-        let weird = WEIRD_SHAPE;
+        let weird = self.s.weird_shape;
 
         let (shape, hx, hy) = if pick == Pick::LongHole {
             let a = if self.rng.chance(weird) {
@@ -717,7 +718,7 @@ impl World {
             (Shape::new(Kind::Circle { r }, 0.0), x, top + r * self.rng.range(-0.15, 0.35))
         };
 
-        let life = vary(&mut self.rng, HOLE_DURATION, HOLE_DURATION_VARIANCE);
+        let life = vary(&mut self.rng, self.s.hole_duration, self.s.hole_duration_variance);
         let reach = shape.radius();
         let (fall, out) = (self.fall, shape.out_time(self.fall));
         for (j, o) in self.obstacles.iter_mut().enumerate() {

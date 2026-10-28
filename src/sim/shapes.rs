@@ -333,6 +333,11 @@ impl Obstacle {
         self.age < self.life
     }
 
+    /// Start leaving now, the way it would at the end of its life.
+    pub fn retire(&mut self) {
+        self.life = self.life.min(self.age);
+    }
+
     pub fn bounds(&self, w: usize, h: usize) -> Option<Region> {
         region(self.cx, self.cy, self.ex, self.ey, w, h)
     }

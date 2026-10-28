@@ -2,6 +2,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use crate::rng::Rng;
+use crate::settings::Settings;
 
 mod generate;
 mod shapes;
@@ -19,94 +20,10 @@ pub const SAND_COLORS: u32 = 127;
 const GROW_TIME: f32 = 1.2;
 const SHRINK_TIME: f32 = 1.2;
 const EMITTER_FADE: f32 = 0.6;
-const HUE_SPEED: f32 = 15.0; // palette indices per second
-
-// ---------------------------------------------------------------------------
-// Tunable parameters
-//
-// Every `*_VARIANCE` is a fraction: a value is drawn uniformly from
-// `mean * (1 - variance) ..= mean * (1 + variance)`, so 0.0 means no variation
-// and 0.5 means plus or minus 50%. Sizes are in pixels of a 1080p screen and
-// scale with the resolution.
-// ---------------------------------------------------------------------------
-
-/// Average number of obstacles on screen. `None` picks a number from the screen
-/// area (roughly one per 130 000 pixels at 1080p), clamped to 3..=120.
-const OBSTACLE_COUNT: Option<usize> = None;
-/// How much the number of obstacles wanted drifts over time.
-const OBSTACLE_COUNT_VARIANCE: f32 = 0.5;
-/// Average time in seconds an obstacle stays fully grown.
-const OBSTACLE_DURATION: f32 = 10.0;
-const OBSTACLE_DURATION_VARIANCE: f32 = 0.5;
-
-/// Average number of sand streams. `None` picks a number from the screen width,
-/// clamped to 3..=8.
-const STREAM_COUNT: Option<usize> = Some(1);
-/// How much the number of streams wanted drifts over time.
-const STREAM_COUNT_VARIANCE: f32 = 0.0;
-/// Average grains per stream cell per substep (0.0 to 1.0).
-const STREAM_DENSITY: f32 = 0.08;
-const STREAM_DENSITY_VARIANCE: f32 = 0.00;
-/// Average stream width in pixels.
-const STREAM_WIDTH: f32 = 9999.0;
-const STREAM_WIDTH_VARIANCE: f32 = 0.0;
-/// Average time in seconds a stream flows.
-const STREAM_DURATION: f32 = 9999.0;
-const STREAM_DURATION_VARIANCE: f32 = 0.0;
 
 /// The wanted obstacle and stream counts are redrawn this often (seconds,
 /// min and max).
 const COUNT_REDRAW: (f32, f32) = (6.0, 14.0);
-
-// --- What obstacles are made of ---------------------------------------------
-//
-// Relative frequencies of each kind. Holes cut into existing obstacles, so
-// they only appear once there is something to cut; they count towards the
-// obstacle count. A funnel counts as one obstacle.
-const SLOPE_WEIGHT: f32 = 3.0;
-const DIAMOND_WEIGHT: f32 = 1.2;
-const CIRCLE_WEIGHT: f32 = 1.4;
-const FUNNEL_WEIGHT: f32 = 1.0;
-const LONG_HOLE_WEIGHT: f32 = 3.2;
-const CIRCLE_HOLE_WEIGHT: f32 = 1.2;
-/// Average time in seconds a hole stays open (never longer than its obstacle).
-const HOLE_DURATION: f32 = 10.0;
-const HOLE_DURATION_VARIANCE: f32 = 0.4;
-
-// --- How streams and obstacles influence each other (0.0 to 1.0) --------------
-//
-/// How strongly streams pull obstacles towards them: which kind is built,
-/// and building it under a stream rather than anywhere. 0.0 ignores streams.
-const STREAMS_ATTRACT_OBSTACLES: f32 = 0.8;
-/// How strongly obstacles pull streams towards them: new streams start above
-/// obstacles rather than anywhere. 0.0 ignores obstacles.
-const OBSTACLES_ATTRACT_STREAMS: f32 = 0.6;
-/// How strongly a new obstacle is placed so that the stream it makes falls
-/// onto another obstacle, rather than being the first acceptable spot.
-const OBSTACLE_CHAINING: f32 = 0.9;
-/// Streams wider than this (pixels, counting touching streams) are "wide".
-const WIDE_STREAM: f32 = 60.0;
-/// Smallest gap (pixels at 1080p) left between a new obstacle and the others,
-/// unless `WEIRD_OVERLAP` lets it through.
-const OBSTACLE_CLEARANCE: f32 = 20.0;
-
-// --- Weirdness (0.0 follows the rules strictly, 1.0 lets chance take over) ---
-//
-/// Chance the kind of obstacle ignores what the streams suggest.
-const WEIRD_KIND: f32 = 0.0;
-/// Chance an obstacle or stream is placed anywhere instead of by the rules.
-const WEIRD_PLACEMENT: f32 = 0.0;
-/// Chance of unusual angles and proportions: slopes outside 30-60 degrees,
-/// lopsided funnels, craters instead of clean cuts.
-const WEIRD_SHAPE: f32 = 0.0;
-/// Chance an obstacle may overlap others.
-const WEIRD_OVERLAP: f32 = 0.05;
-/// Chance a slope redirects a stream forwards instead of backwards.
-const WEIRD_REDIRECT: f32 = 0.1;
-/// Chance something may recreate a stream that has only just vanished.
-const WEIRD_LOOPS: f32 = 1.0;
-/// How long (seconds) a vanished stream is remembered.
-const LOOP_MEMORY: f32 = 0.0;
 
 /// `mean` varied by up to plus or minus the fraction `variance`.
 fn vary(rng: &mut Rng, mean: f32, variance: f32) -> f32 {
@@ -166,17 +83,12 @@ pub struct World {
     target_emitters: usize,
     count_timer: f32,
     hue: f32,
+    s: Settings,
 }
 
 impl World {
-    pub fn new(w: usize, h: usize) -> Self {
+    pub fn new(w: usize, h: usize, s: Settings) -> Self {
         let unit = h as f32 / 1080.0;
-        let base_obstacles = OBSTACLE_COUNT.map_or_else(
-            || ((w * h) as f32 / (unit * unit * 130_000.0)).round().clamp(3.0, 120.0),
-            |n| n as f32,
-        );
-        let base_emitters =
-            STREAM_COUNT.map_or_else(|| (w as f32 / 560.0).round().clamp(3.0, 8.0), |n| n as f32);
         let substeps = (h as f32 / 360.0).round().clamp(2.0, 4.0) as usize;
 
         let mut world = World {
@@ -195,13 +107,15 @@ impl World {
             unit,
             substeps,
             fall: substeps as f32 * 60.0,
-            base_obstacles,
-            base_emitters,
+            base_obstacles: 0.0,
+            base_emitters: 0.0,
             target_obstacles: 0,
             target_emitters: 0,
             count_timer: 0.0,
             hue: 0.0,
+            s,
         };
+        world.recompute_bases();
         world.redraw_counts();
         let target_obstacles = world.target_obstacles;
         let target_emitters = world.target_emitters;
@@ -223,6 +137,42 @@ impl World {
         world
     }
 
+    /// Average wanted counts: the setting, or a number from the screen size.
+    fn recompute_bases(&mut self) {
+        let (w, h, k) = (self.w as f32, self.h as f32, self.unit);
+        self.base_obstacles = if self.s.obstacle_count >= 0.5 {
+            self.s.obstacle_count.round()
+        } else {
+            (w * h / (k * k * 130_000.0)).round().clamp(3.0, 120.0)
+        };
+        self.base_emitters = if self.s.stream_count >= 0.5 {
+            self.s.stream_count.round()
+        } else {
+            (w / 560.0).round().clamp(3.0, 8.0)
+        };
+    }
+
+    /// Switch to new settings on the fly. Obstacles beyond the new wanted
+    /// count start leaving, oldest first; extra streams just are not replaced.
+    pub fn apply_settings(&mut self, s: Settings) {
+        self.s = s;
+        self.recompute_bases();
+        self.redraw_counts();
+        let mut excess = self.obstacle_count().saturating_sub(self.target_obstacles);
+        let mut i = 0;
+        while excess > 0 && i < self.obstacles.len() {
+            if self.obstacles[i].is_live() && !self.obstacles[i].part {
+                let holes = self.obstacles[i].holes.iter().filter(|h| h.primary).count();
+                self.obstacles[i].retire();
+                if let Some(p) = self.obstacles.get_mut(i + 1).filter(|p| p.part) {
+                    p.retire();
+                }
+                excess = excess.saturating_sub(1 + holes);
+            }
+            i += 1;
+        }
+    }
+
     /// Obstacles and holes, counting a funnel once.
     fn obstacle_count(&self) -> usize {
         let holes = self.obstacles.iter().flat_map(|o| &o.holes).filter(|h| h.primary).count();
@@ -232,15 +182,15 @@ impl World {
     /// Draw new wanted obstacle and stream counts. Extra obstacles and streams
     /// are not removed; they just are not replaced when they expire.
     fn redraw_counts(&mut self) {
-        let o = vary(&mut self.rng, self.base_obstacles, OBSTACLE_COUNT_VARIANCE);
-        let e = vary(&mut self.rng, self.base_emitters, STREAM_COUNT_VARIANCE);
+        let o = vary(&mut self.rng, self.base_obstacles, self.s.obstacle_count_variance);
+        let e = vary(&mut self.rng, self.base_emitters, self.s.stream_count_variance);
         self.target_obstacles = (o.round().max(0.0) as usize).min(120);
         self.target_emitters = e.round().max(0.0) as usize;
         self.count_timer = self.rng.range(COUNT_REDRAW.0, COUNT_REDRAW.1);
     }
 
     pub fn update(&mut self, dt: f32) {
-        self.hue = (self.hue + dt * HUE_SPEED) % SAND_COLORS as f32;
+        self.hue = (self.hue + dt * self.s.hue_speed) % SAND_COLORS as f32;
         self.count_timer -= dt;
         if self.count_timer <= 0.0 {
             self.redraw_counts();
@@ -273,7 +223,7 @@ impl World {
                 // The streams falling off it are about to vanish.
                 o.retired = true;
                 for f in self.flows.iter().filter(|f| f.src == Some(o.id)) {
-                    self.vanished.push(Vanished { x: f.x, y: f.y, ttl: LOOP_MEMORY });
+                    self.vanished.push(Vanished { x: f.x, y: f.y, ttl: self.s.loop_memory });
                 }
             }
         }
@@ -301,9 +251,10 @@ impl World {
     fn spawn_emitter(&mut self, age: f32) {
         let k = self.unit;
         let x = self.emitter_x();
-        let half_w = (vary(&mut self.rng, STREAM_WIDTH, STREAM_WIDTH_VARIANCE) * 0.5 * k).max(0.5);
-        let density = vary(&mut self.rng, STREAM_DENSITY, STREAM_DENSITY_VARIANCE).clamp(0.0, 1.0);
-        let life = vary(&mut self.rng, STREAM_DURATION, STREAM_DURATION_VARIANCE).max(2.0 * EMITTER_FADE);
+        let s = self.s;
+        let half_w = (vary(&mut self.rng, s.stream_width, s.stream_width_variance) * 0.5 * k).max(0.5);
+        let density = vary(&mut self.rng, s.stream_density, s.stream_density_variance).clamp(0.0, 1.0);
+        let life = vary(&mut self.rng, s.stream_duration, s.stream_duration_variance).max(2.0 * EMITTER_FADE);
         let hue = self.rng.range(0.0, SAND_COLORS as f32);
         self.emitters.push(Emitter {
             x,
@@ -318,10 +269,10 @@ impl World {
     fn update_emitters(&mut self, dt: f32) {
         for e in self.emitters.iter_mut() {
             e.age += dt;
-            e.hue = (e.hue + dt * HUE_SPEED) % SAND_COLORS as f32;
+            e.hue = (e.hue + dt * self.s.hue_speed) % SAND_COLORS as f32;
         }
         for e in self.emitters.iter().filter(|e| e.age >= e.life) {
-            self.vanished.push(Vanished { x: e.x, y: 0.0, ttl: LOOP_MEMORY });
+            self.vanished.push(Vanished { x: e.x, y: 0.0, ttl: self.s.loop_memory });
         }
         self.emitters.retain(|e| e.age < e.life);
         while self.emitters.len() < self.target_emitters {
@@ -624,7 +575,7 @@ mod tests {
         let (mut pairs, mut total, mut top) = (0, 0, 0);
         let mut bands = [0usize; 5];
         for _ in 0..30 {
-            let world = World::new(1280, 720);
+            let world = World::new(1280, 720, Settings::default());
             let obs = &world.obstacles;
             for (i, a) in obs.iter().enumerate() {
                 total += 1;
@@ -683,7 +634,7 @@ mod tests {
     /// Every obstacle, including swept slopes and holes, disappears fully.
     #[test]
     fn obstacles_clear_completely() {
-        let mut world = World::new(1280, 720);
+        let mut world = World::new(1280, 720, Settings::default());
         for _ in 0..600 {
             world.update(1.0 / 60.0);
         }
@@ -698,7 +649,7 @@ mod tests {
 
     #[test]
     fn world_picture() {
-        let mut world = World::new(1280, 720);
+        let mut world = World::new(1280, 720, Settings::default());
         for f in 1..=1800 {
             world.update(1.0 / 60.0);
             if f % 600 == 0 {
@@ -708,9 +659,51 @@ mod tests {
         println!("WORLD\n{}", r::ascii(&world.cells, 1280, 720, 8, 12));
     }
 
+    /// Settings can change while running: fewer obstacles and streams are
+    /// wanted, and extreme values do not break anything.
+    #[test]
+    fn settings_apply_live() {
+        use crate::settings::{builtin, ITEMS};
+        let mut world = World::new(640, 360, Settings::default());
+        for _ in 0..300 {
+            world.update(1.0 / 60.0);
+        }
+        let few = Settings {
+            obstacle_count: 2.0,
+            obstacle_count_variance: 0.0,
+            stream_count: 1.0,
+            stream_count_variance: 0.0,
+            ..Settings::default()
+        };
+        world.apply_settings(few);
+        for _ in 0..60 * 40 {
+            world.update(1.0 / 60.0);
+        }
+        assert!(world.obstacle_count() <= 3, "{} obstacles", world.obstacle_count());
+        assert_eq!(world.emitters.len(), 1);
+
+        // Every preset, and every setting at either end of its range.
+        for p in builtin() {
+            world.apply_settings(p.settings);
+            for _ in 0..120 {
+                world.update(1.0 / 60.0);
+            }
+        }
+        for i in 0..ITEMS.len() {
+            for end in [ITEMS[i].min, ITEMS[i].max] {
+                let mut s = Settings::default();
+                s.set_item(i, end);
+                world.apply_settings(s);
+                for _ in 0..30 {
+                    world.update(1.0 / 60.0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn bench_4k() {
-        let mut world = World::new(3840, 2160);
+        let mut world = World::new(3840, 2160, Settings::default());
         for _ in 0..600 {
             world.update(1.0 / 60.0);
         }

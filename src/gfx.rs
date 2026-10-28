@@ -23,8 +23,32 @@ fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{
     )
 }
 
+/// Draws the overlay image 1:1 at the top left of the surface (the viewport
+/// is set to the image's size).
+const OVERLAY_SHADER: &str = r#"
+@group(0) @binding(0) var ui: texture_2d<f32>;
+
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    var p = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(p[i], 0.0, 1.0);
+}
+
+@fragment
+fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return textureLoad(ui, vec2<i32>(pos.xy), 0);
+}
+"#;
+
+struct Overlay {
+    bind_group: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
 /// Presents the cell grid: the grid is uploaded as an R8 texture and colored
-/// on the GPU through a 256-entry palette.
+/// on the GPU through a 256-entry palette. An optional premultiplied RGBA
+/// image can be drawn over it.
 pub struct Gfx {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -32,10 +56,14 @@ pub struct Gfx {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    lut_tex: wgpu::Texture,
     lut_view: wgpu::TextureView,
     cells_tex: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     scale: u32,
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_layout: wgpu::BindGroupLayout,
+    overlay: Option<Overlay>,
 }
 
 impl Gfx {
@@ -100,29 +128,7 @@ impl Gfx {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let mut lut_bytes = Vec::with_capacity(256 * 4);
-        for &c in lut {
-            lut_bytes.extend_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
-        }
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &lut_tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &lut_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(256 * 4),
-                rows_per_image: Some(1),
-            },
-            wgpu::Extent3d {
-                width: 256,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
+        write_lut(&queue, &lut_tex, lut);
         let lut_view = lut_tex.create_view(&Default::default());
 
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -188,6 +194,54 @@ impl Gfx {
         let (cells_tex, bind_group) =
             make_cells(&device, &layout, &lut_view, w.div_ceil(scale), h.div_ceil(scale));
 
+        let overlay_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let overlay_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[&overlay_layout],
+            push_constant_ranges: &[],
+        });
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+        });
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&overlay_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Gfx {
             surface,
             device,
@@ -195,11 +249,61 @@ impl Gfx {
             config,
             pipeline,
             layout,
+            lut_tex,
             lut_view,
             cells_tex,
             bind_group,
             scale,
+            overlay_pipeline,
+            overlay_layout,
+            overlay: None,
         }
+    }
+
+    /// Replace the palette.
+    pub fn set_lut(&self, lut: &[u32; 256]) {
+        write_lut(&self.queue, &self.lut_tex, lut);
+    }
+
+    /// Draw this premultiplied RGBA image over the simulation, or nothing.
+    pub fn set_overlay(&mut self, image: Option<(u32, u32, &[u8])>) {
+        self.overlay = image.map(|(w, h, rgba)| {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("overlay"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            let view = tex.create_view(&Default::default());
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.overlay_layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                }],
+            });
+            Overlay { bind_group, w, h }
+        });
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -273,10 +377,40 @@ impl Gfx {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
+            if let Some(o) = &self.overlay {
+                if o.w <= self.config.width && o.h <= self.config.height {
+                    pass.set_viewport(0.0, 0.0, o.w as f32, o.h as f32, 0.0, 1.0);
+                    pass.set_pipeline(&self.overlay_pipeline);
+                    pass.set_bind_group(0, &o.bind_group, &[]);
+                    pass.draw(0..3, 0..1);
+                }
+            }
         }
         self.queue.submit(Some(encoder.finish()));
         frame.present();
     }
+}
+
+fn write_lut(queue: &wgpu::Queue, tex: &wgpu::Texture, lut: &[u32; 256]) {
+    let mut bytes = Vec::with_capacity(256 * 4);
+    for &c in lut {
+        bytes.extend_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
+    }
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &bytes,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(256 * 4),
+            rows_per_image: Some(1),
+        },
+        wgpu::Extent3d { width: 256, height: 1, depth_or_array_layers: 1 },
+    );
 }
 
 fn make_cells(
