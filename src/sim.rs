@@ -86,13 +86,16 @@ const OBSTACLES_ATTRACT_STREAMS: f32 = 0.6;
 const OBSTACLE_CHAINING: f32 = 0.7;
 /// Streams wider than this (pixels, counting touching streams) are "wide".
 const WIDE_STREAM: f32 = 60.0;
+/// Smallest gap (pixels at 1080p) left between a new obstacle and the others,
+/// unless `WEIRD_OVERLAP` lets it through.
+const OBSTACLE_CLEARANCE: f32 = 28.0;
 
 // --- Weirdness (0.0 follows the rules strictly, 1.0 lets chance take over) ---
 //
 /// Chance the kind of obstacle ignores what the streams suggest.
 const WEIRD_KIND: f32 = 0.15;
 /// Chance an obstacle or stream is placed anywhere instead of by the rules.
-const WEIRD_PLACEMENT: f32 = 0.15;
+const WEIRD_PLACEMENT: f32 = 0.3;
 /// Chance of unusual angles and proportions: slopes outside 30-60 degrees,
 /// lopsided funnels, craters instead of clean cuts.
 const WEIRD_SHAPE: f32 = 0.15;
@@ -154,6 +157,8 @@ pub struct World {
     /// Scale factor relative to a 1080p screen.
     unit: f32,
     substeps: usize,
+    /// Speed sand falls at, in pixels per second.
+    fall: f32,
     /// Average wanted counts, and the currently wanted counts drawn from them.
     base_obstacles: f32,
     base_emitters: f32,
@@ -189,6 +194,7 @@ impl World {
             vanished: Vec::new(),
             unit,
             substeps,
+            fall: substeps as f32 * 60.0,
             base_obstacles,
             base_emitters,
             target_obstacles: 0,
@@ -609,6 +615,85 @@ mod tests {
     #[test]
     fn ramp_picture() {
         ramp_run(false);
+    }
+
+    /// Initial layouts: how many obstacle pairs cross, and how the
+    /// obstacles are spread vertically.
+    #[test]
+    fn layout_stats() {
+        let (mut pairs, mut total, mut top) = (0, 0, 0);
+        let mut bands = [0usize; 5];
+        for _ in 0..30 {
+            let world = World::new(1280, 720);
+            let obs = &world.obstacles;
+            for (i, a) in obs.iter().enumerate() {
+                total += 1;
+                let band = ((a.cy / 720.0 * 5.0) as usize).min(4);
+                bands[band] += 1;
+                if a.cy < 720.0 * 0.25 {
+                    top += 1;
+                }
+                for b in &obs[i + 1..] {
+                    let hit = (a.cy as i32 - 360..a.cy as i32 + 360).step_by(3).any(|y| {
+                        (a.cx as i32 - 400..a.cx as i32 + 400).step_by(3).any(|x| {
+                            let (x, y) = (x as f32, y as f32);
+                            a.shape.contains(x - a.cx, y - a.cy, 1.0) && b.shape.contains(x - b.cx, y - b.cy, 1.0)
+                        })
+                    });
+                    pairs += hit as usize;
+                }
+            }
+        }
+        println!("LAYOUT obstacles={total} crossing_pairs={pairs} top_quarter={top} bands={bands:?}");
+    }
+
+    /// A slope's lower tip descends at the sand's fall speed while it grows,
+    /// and its upper end leaves first when it shrinks.
+    #[test]
+    fn slope_sweeps_at_fall_speed() {
+        let speed = 120.0;
+        for deg in [-50.0f32, -20.0, 20.0, 45.0, 70.0] {
+            let shape = Shape::new(Kind::Rect { hl: 150.0, ht: 6.0 }, deg.to_radians());
+            let lowest = |ph: shapes::Phase| {
+                let mut best = f32::MIN;
+                let mut y = -200.0;
+                while y < 200.0 {
+                    let mut x = -200.0;
+                    while x < 200.0 {
+                        if shape.covers(x, y, ph) {
+                            best = best.max(y);
+                        }
+                        x += 1.0;
+                    }
+                    y += 0.5;
+                }
+                best
+            };
+            let a = lowest(shape.phase(0.2, 10.0, speed));
+            let b = lowest(shape.phase(0.4, 10.0, speed));
+            let fall = (b - a) / 0.2;
+            assert!((fall - speed).abs() < 6.0, "{deg} deg: tip falls {fall}");
+            let out = shape.out_time(speed);
+            let mid = shape.phase(10.0 + out * 0.5, 10.0, speed);
+            assert!(mid.lo > 0.0 && mid.hi > mid.lo, "{deg}: retreats from the top");
+            assert!(shape.phase(10.0 + out, 10.0, speed).gone());
+        }
+    }
+
+    /// Every obstacle, including swept slopes and holes, disappears fully.
+    #[test]
+    fn obstacles_clear_completely() {
+        let mut world = World::new(1280, 720);
+        for _ in 0..600 {
+            world.update(1.0 / 60.0);
+        }
+        world.count_timer = 1.0e9;
+        world.target_obstacles = 0;
+        for _ in 0..60 * 60 {
+            world.update(1.0 / 60.0);
+        }
+        assert!(world.obstacles.is_empty(), "{} left", world.obstacles.len());
+        assert!(world.cells.iter().all(|&c| c < OBSTACLE_BASE), "stray obstacle cells");
     }
 
     #[test]

@@ -373,7 +373,7 @@ impl World {
             let life = vary(&mut self.rng, OBSTACLE_DURATION, OBSTACLE_DURATION_VARIANCE).max(1.0);
             for (i, p) in c.pieces.into_iter().enumerate() {
                 let id = self.free_ids.pop().unwrap();
-                let mut o = Obstacle::new(p.shape, p.cx, p.cy, id, life);
+                let mut o = Obstacle::new(p.shape, p.cx, p.cy, id, life, self.fall);
                 o.part = i > 0;
                 self.obstacles.push(o);
             }
@@ -386,20 +386,28 @@ impl World {
         p.cx - ex > -0.3 * ex && p.cx + ex < w + 0.3 * ex && p.cy - ey > h * 0.03 && p.cy + ey < h * 0.97
     }
 
+    /// Whether a piece touches, or comes within a clearance of, an obstacle
+    /// that is there or on its way. Obstacles are tested at full size.
     fn overlaps(&self, p: &Piece) -> bool {
         let (ex, ey) = p.shape.extent();
         let step = (5.0 * self.unit).max(3.0);
+        let pad = OBSTACLE_CLEARANCE * self.unit;
+        let offsets = [(0.0, 0.0), (pad, 0.0), (-pad, 0.0), (0.0, pad), (0.0, -pad)];
         for o in &self.obstacles {
-            if o.scale() < 0.05 || (o.cx - p.cx).abs() > o.ex + ex || (o.cy - p.cy).abs() > o.ey + ey {
+            if !o.is_live() || (o.cx - p.cx).abs() > o.ex + ex + pad || (o.cy - p.cy).abs() > o.ey + ey + pad {
                 continue;
             }
-            let (x0, x1) = ((p.cx - ex).max(o.cx - o.ex), (p.cx + ex).min(o.cx + o.ex));
-            let (y0, y1) = ((p.cy - ey).max(o.cy - o.ey), (p.cy + ey).min(o.cy + o.ey));
+            let (x0, x1) = ((p.cx - ex).max(o.cx - o.ex - pad), (p.cx + ex).min(o.cx + o.ex + pad));
+            let (y0, y1) = ((p.cy - ey).max(o.cy - o.ey - pad), (p.cy + ey).min(o.cy + o.ey + pad));
             let mut y = y0;
             while y <= y1 {
                 let mut x = x0;
                 while x <= x1 {
-                    if p.shape.contains(x - p.cx, y - p.cy, 1.1) && o.shape.contains(x - o.cx, y - o.cy, 1.1) {
+                    if p.shape.contains(x - p.cx, y - p.cy, 1.0)
+                        && offsets
+                            .iter()
+                            .any(|&(ox, oy)| o.shape.contains(x + ox - o.cx, y + oy - o.cy, 1.0))
+                    {
                         return true;
                     }
                     x += step;
@@ -417,7 +425,7 @@ impl World {
         let (mut chain, mut total, mut looped) = (0.0, 0.0, false);
         for &(i, lx, ly) in &c.landings {
             let p = &c.pieces[i];
-            let temp = Obstacle::new(p.shape, p.cx, p.cy, 0, 1.0);
+            let temp = Obstacle::new(p.shape, p.cx, p.cy, 0, 1.0, self.fall);
             for (ex, ey, d, _) in outflow(&temp, lx, ly, k) {
                 total += 1.0;
                 looped |= self.is_loop(ex, ey);
@@ -711,6 +719,7 @@ impl World {
 
         let life = vary(&mut self.rng, HOLE_DURATION, HOLE_DURATION_VARIANCE);
         let reach = shape.radius();
+        let (fall, out) = (self.fall, shape.out_time(self.fall));
         for (j, o) in self.obstacles.iter_mut().enumerate() {
             let primary = j == t;
             if !primary
@@ -720,9 +729,10 @@ impl World {
             {
                 continue;
             }
-            let life = life.min(o.life - o.age - SHRINK_TIME);
+            // Gone again before the obstacle starts to go.
+            let life = life.min(o.life - o.age - out);
             if life >= 1.5 {
-                o.holes.push(Hole::new(shape, hx, hy, life, primary));
+                o.holes.push(Hole::new(shape, hx, hy, life, primary, fall));
             }
         }
         true

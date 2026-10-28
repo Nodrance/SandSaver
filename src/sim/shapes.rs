@@ -14,6 +14,24 @@ pub enum Kind {
     Para { hl: f32, vt: f32, slope: f32 },
 }
 
+/// How much of a shape exists. Compact shapes (circles, squares) grow and
+/// shrink uniformly: `hi` is the scale. Long shapes (slopes, holes, funnel
+/// walls) are swept: the part between `lo` and `hi`, measured in pixels along
+/// the long axis from the upper end, exists.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Phase {
+    pub lo: f32,
+    pub hi: f32,
+}
+
+impl Phase {
+    pub const NONE: Phase = Phase { lo: 0.0, hi: 0.0 };
+
+    pub fn gone(&self) -> bool {
+        self.hi <= self.lo
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Shape {
     pub kind: Kind,
@@ -57,8 +75,133 @@ impl Shape {
         }
     }
 
+    /// Long thin shapes are swept in along their length; others are scaled.
+    pub fn sweeps(&self) -> bool {
+        match self.kind {
+            Kind::Rect { hl, ht } => hl >= 2.0 * ht,
+            Kind::Circle { .. } => false,
+            Kind::Para { .. } => true,
+        }
+    }
+
+    fn half_len(&self) -> f32 {
+        match self.kind {
+            Kind::Rect { hl, .. } | Kind::Para { hl, .. } => hl,
+            Kind::Circle { r } => r,
+        }
+    }
+
+    /// Whether the upper end of the long axis is at positive local x.
+    fn flipped(&self) -> bool {
+        match self.kind {
+            Kind::Rect { .. } => self.sin < 0.0,
+            Kind::Para { slope, .. } => slope < 0.0,
+            Kind::Circle { .. } => false,
+        }
+    }
+
+    /// How fast (pixels per second along the axis) a swept shape grows so that
+    /// its lower end descends at `speed`, the speed sand falls at.
+    fn rate(&self, speed: f32) -> f32 {
+        let v = match self.kind {
+            Kind::Rect { .. } => self.sin.abs(),
+            Kind::Para { slope, .. } => slope.abs(),
+            Kind::Circle { .. } => 1.0,
+        };
+        speed / v.max(0.12)
+    }
+
+    /// How long the shape takes to disappear after its lifetime.
+    pub fn out_time(&self, speed: f32) -> f32 {
+        if self.sweeps() {
+            2.0 * self.half_len() / self.rate(speed)
+        } else {
+            SHRINK_TIME
+        }
+    }
+
+    /// What exists `age` seconds after creation, for a shape that holds for
+    /// `life` seconds.
+    pub fn phase(&self, age: f32, life: f32, speed: f32) -> Phase {
+        if self.sweeps() {
+            let r = self.rate(speed);
+            let len = 2.0 * self.half_len();
+            // Exactly gone once the time is up, whatever the rounding.
+            let lo = if age >= life + len / r { len } else { ((age - life) * r).clamp(0.0, len) };
+            Phase {
+                lo,
+                hi: (age * r).clamp(0.0, len),
+            }
+        } else {
+            Phase {
+                lo: 0.0,
+                hi: envelope(age, life),
+            }
+        }
+    }
+
     /// Whether the point (dx, dy), relative to the shape centre, lies inside
-    /// the shape scaled by `s`.
+    /// the part of the shape that exists in phase `ph`.
+    pub fn covers(&self, dx: f32, dy: f32, ph: Phase) -> bool {
+        if ph.gone() {
+            return false;
+        }
+        if !self.sweeps() {
+            return self.contains(dx, dy, ph.hi);
+        }
+        if !self.contains(dx, dy, 1.0) {
+            return false;
+        }
+        let lx = dx * self.cos + dy * self.sin;
+        let hl = self.half_len();
+        let u = if self.flipped() { hl - lx } else { hl + lx };
+        u >= ph.lo && u <= ph.hi
+    }
+
+    /// Bounding box of what changes between two phases of a shape at (cx, cy).
+    pub fn change_region(&self, cx: f32, cy: f32, old: Phase, new: Phase, w: usize, h: usize) -> Option<Region> {
+        if !self.sweeps() {
+            let (ex, ey) = self.extent();
+            let m = old.hi.max(new.hi).max(0.0);
+            return region(cx, cy, ex * m, ey * m, w, h);
+        }
+        let mut out = None;
+        for (a, b) in [(old.hi, new.hi), (old.lo, new.lo)] {
+            let (a, b) = (a.min(b), a.max(b));
+            if b > a {
+                if let Some(r) = self.span_region(cx, cy, a, b, w, h) {
+                    out = Some(union(out, r));
+                }
+            }
+        }
+        out
+    }
+
+    /// Bounding box of the part of a swept shape between `u0` and `u1`.
+    fn span_region(&self, cx: f32, cy: f32, u0: f32, u1: f32, w: usize, h: usize) -> Option<Region> {
+        let hl = self.half_len();
+        let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for u in [u0, u1] {
+            let lx = if self.flipped() { hl - u } else { u - hl };
+            let (a, b) = match self.kind {
+                Kind::Rect { ht, .. } => (-ht, ht),
+                Kind::Para { vt, slope, .. } => (slope * lx - vt, slope * lx + vt),
+                Kind::Circle { .. } => (0.0, 0.0),
+            };
+            for ly in [a, b] {
+                let dx = lx * self.cos - ly * self.sin;
+                let dy = lx * self.sin + ly * self.cos;
+                x0 = x0.min(dx);
+                x1 = x1.max(dx);
+                y0 = y0.min(dy);
+                y1 = y1.max(dy);
+            }
+        }
+        region(cx + (x0 + x1) * 0.5, cy + (y0 + y1) * 0.5, (x1 - x0) * 0.5, (y1 - y0) * 0.5, w, h)
+    }
+
+    /// Whether the point (dx, dy), relative to the shape centre, lies inside
+    /// the whole shape scaled by `s`.
     pub fn contains(&self, dx: f32, dy: f32, s: f32) -> bool {
         if s <= 0.0 {
             return false;
@@ -99,38 +242,38 @@ pub struct Hole {
     pub shape: Shape,
     pub cx: f32,
     pub cy: f32,
-    ex: f32,
-    ey: f32,
     pub age: f32,
     pub life: f32,
-    /// Scale it was last painted at.
-    pub applied: f32,
+    /// Fall speed (pixels per second) it is swept in and out at.
+    speed: f32,
+    out: f32,
+    /// Phase it was last painted at.
+    applied: Phase,
     /// Counts towards the obstacle count (one copy per hole).
     pub primary: bool,
 }
 
 impl Hole {
-    pub fn new(shape: Shape, cx: f32, cy: f32, life: f32, primary: bool) -> Self {
-        let (ex, ey) = shape.extent();
+    pub fn new(shape: Shape, cx: f32, cy: f32, life: f32, primary: bool, speed: f32) -> Self {
         Hole {
             shape,
             cx,
             cy,
-            ex,
-            ey,
             age: 0.0,
             life,
-            applied: -1.0,
+            speed,
+            out: shape.out_time(speed),
+            applied: Phase::NONE,
             primary,
         }
     }
 
-    pub fn scale(&self) -> f32 {
-        envelope(self.age, self.life)
+    pub fn phase(&self) -> Phase {
+        self.shape.phase(self.age, self.life, self.speed)
     }
 
     fn finished(&self) -> bool {
-        self.age >= self.life + SHRINK_TIME && self.applied <= 0.0
+        self.age >= self.life + self.out && self.applied.gone()
     }
 }
 
@@ -144,7 +287,10 @@ pub struct Obstacle {
     pub id: u8,
     pub age: f32,
     pub life: f32,
-    pub applied: f32,
+    /// Fall speed (pixels per second) it is swept in and out at.
+    speed: f32,
+    out: f32,
+    applied: Phase,
     pub holes: Vec<Hole>,
     /// Second half of a funnel; not counted separately.
     pub part: bool,
@@ -153,7 +299,7 @@ pub struct Obstacle {
 }
 
 impl Obstacle {
-    pub fn new(shape: Shape, cx: f32, cy: f32, id: u8, life: f32) -> Self {
+    pub fn new(shape: Shape, cx: f32, cy: f32, id: u8, life: f32, speed: f32) -> Self {
         let (ex, ey) = shape.extent();
         Obstacle {
             shape,
@@ -165,29 +311,30 @@ impl Obstacle {
             id,
             age: 0.0,
             life,
-            applied: -1.0,
+            speed,
+            out: shape.out_time(speed),
+            applied: Phase::NONE,
             holes: Vec::new(),
             part: false,
             retired: false,
         }
     }
 
-    pub fn scale(&self) -> f32 {
-        envelope(self.age, self.life)
+    pub fn phase(&self) -> Phase {
+        self.shape.phase(self.age, self.life, self.speed)
     }
 
     pub fn finished(&self) -> bool {
-        self.age >= self.life + SHRINK_TIME && self.applied <= 0.0
+        self.age >= self.life + self.out && self.applied.gone()
     }
 
-    /// Fully grown and not yet shrinking.
+    /// Present and not yet retiring (still growing counts: it will be there).
     pub fn is_live(&self) -> bool {
-        self.age < self.life && self.scale() > 0.5
+        self.age < self.life
     }
 
-    pub fn bounds(&self, scale: f32, w: usize, h: usize) -> Option<Region> {
-        let m = scale.max(0.0);
-        region(self.cx, self.cy, self.ex * m, self.ey * m, w, h)
+    pub fn bounds(&self, w: usize, h: usize) -> Option<Region> {
+        region(self.cx, self.cy, self.ex, self.ey, w, h)
     }
 
     /// Solid at full size, with the holes as they are now.
@@ -196,7 +343,7 @@ impl Obstacle {
             && !self
                 .holes
                 .iter()
-                .any(|h| h.shape.contains(x - h.cx, y - h.cy, h.scale()))
+                .any(|h| h.shape.covers(x - h.cx, y - h.cy, h.phase()))
     }
 
     /// Height of the first solid point in column `x` at or below `y0`.
@@ -232,20 +379,20 @@ impl Obstacle {
     }
 }
 
-/// Paint the obstacle at scale `s` inside `reg`. Cells owned by the obstacle
+/// Paint the obstacle in phase `ph` inside `reg`. Cells owned by the obstacle
 /// that it no longer covers are cleared; sand in the way is overwritten.
-pub fn paint(cells: &mut [u8], w: usize, o: &Obstacle, s: f32, reg: Region) {
+pub fn paint(cells: &mut [u8], w: usize, o: &Obstacle, ph: Phase, reg: Region) {
     let (x0, x1, y0, y1) = reg;
-    let holes: Vec<(&Hole, f32)> = o.holes.iter().map(|h| (h, h.scale())).collect();
+    let holes: Vec<(&Hole, Phase)> = o.holes.iter().map(|h| (h, h.phase())).collect();
     cells[y0 * w..y1 * w].par_chunks_mut(w).enumerate().for_each(|(i, row)| {
         let dy = (y0 + i) as f32 + 0.5 - o.cy;
         for x in x0..x1 {
             let dx = x as f32 + 0.5 - o.cx;
             let cell = &mut row[x];
-            let inside = o.shape.contains(dx, dy, s)
+            let inside = o.shape.covers(dx, dy, ph)
                 && !holes
                     .iter()
-                    .any(|(h, hs)| h.shape.contains(x as f32 + 0.5 - h.cx, (y0 + i) as f32 + 0.5 - h.cy, *hs));
+                    .any(|(h, hp)| h.shape.covers(x as f32 + 0.5 - h.cx, (y0 + i) as f32 + 0.5 - h.cy, *hp));
             if inside {
                 if *cell < OBSTACLE_BASE {
                     *cell = o.id;
@@ -270,37 +417,31 @@ pub fn update(cells: &mut [u8], w: usize, h: usize, o: &mut Obstacle, dt: f32) {
     for hole in &mut o.holes {
         hole.age += dt;
     }
-    let s = o.scale();
-    if s != o.applied {
-        if let Some(reg) = o.bounds(s.max(o.applied), w, h) {
-            paint(cells, w, o, s, reg);
+    let ph = o.phase();
+    let mut dirty: Option<Region> = None;
+    if ph != o.applied {
+        if let Some(r) = o.shape.change_region(o.cx, o.cy, o.applied, ph, w, h) {
+            dirty = Some(union(dirty, r));
         }
-        o.applied = s;
-        for hole in &mut o.holes {
-            hole.applied = hole.scale();
-        }
-    } else {
-        let mut dirty: Option<Region> = None;
-        for hole in &o.holes {
-            let hs = hole.scale();
-            if hs != hole.applied {
-                let m = hs.max(hole.applied).max(0.0);
-                if let Some(r) = region(hole.cx, hole.cy, hole.ex * m, hole.ey * m, w, h) {
-                    dirty = Some(union(dirty, r));
-                }
-            }
-        }
-        if let Some(d) = dirty {
-            if let Some(b) = o.bounds(s, w, h) {
-                let r = (d.0.max(b.0), d.1.min(b.1), d.2.max(b.2), d.3.min(b.3));
-                if r.0 < r.1 && r.2 < r.3 {
-                    paint(cells, w, o, s, r);
-                }
-            }
-            for hole in &mut o.holes {
-                hole.applied = hole.scale();
+    }
+    for hole in &o.holes {
+        let hp = hole.phase();
+        if hp != hole.applied {
+            if let Some(r) = hole.shape.change_region(hole.cx, hole.cy, hole.applied, hp, w, h) {
+                dirty = Some(union(dirty, r));
             }
         }
     }
+    if let (Some(d), Some(b)) = (dirty, o.bounds(w, h)) {
+        let r = (d.0.max(b.0), d.1.min(b.1), d.2.max(b.2), d.3.min(b.3));
+        if r.0 < r.1 && r.2 < r.3 {
+            paint(cells, w, o, ph, r);
+        }
+    }
+    o.applied = ph;
+    for hole in &mut o.holes {
+        hole.applied = hole.phase();
+    }
     o.holes.retain(|hole| !hole.finished());
 }
+
