@@ -27,7 +27,7 @@ const MAX_INFLIGHT: usize = 4;
 /// Integer resolution divider: the simulation grid is the screen resolution
 /// divided by this (1 = full resolution, 2 = half, 3 = a third, ...). Each
 /// cell is drawn as a SCALE x SCALE block of pixels.
-const SCALE: u32 = 2;
+const SCALE: u32 = 4;
 const _: () = assert!(SCALE >= 1);
 /// Input is ignored briefly after startup so launch-time key/mouse events don't exit immediately.
 const INPUT_GRACE: Duration = Duration::from_millis(1500);
@@ -49,12 +49,56 @@ fn hsv(h: f32, s: f32, v: f32) -> u32 {
     (to8(r) << 16) | (to8(g) << 8) | to8(b)
 }
 
+/// Sand palette lightness and chroma (OKLCH). Equal for every hue, and low
+/// enough that all hues fit inside sRGB.
+const SAND_LIGHTNESS: f32 = 0.80;
+const SAND_CHROMA: f32 = 0.11;
+
+/// OKLCH to packed sRGB. Out-of-gamut colours are brought in by reducing
+/// the chroma, which keeps lightness and hue.
+fn oklch(l: f32, c: f32, h_deg: f32) -> u32 {
+    let h = h_deg.to_radians();
+    let linear = |c: f32| {
+        let (a, b) = (c * h.cos(), c * h.sin());
+        let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+        let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+        let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+        let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+        [
+            4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_93 * s3,
+            -1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_4 * s3,
+            -0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3,
+        ]
+    };
+    let inside = |rgb: &[f32; 3]| rgb.iter().all(|&v| (-0.001..=1.001).contains(&v));
+    let (mut lo, mut hi) = (0.0, c);
+    if !inside(&linear(c)) {
+        for _ in 0..20 {
+            let mid = (lo + hi) * 0.5;
+            if inside(&linear(mid)) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+    } else {
+        lo = c;
+    }
+    let encode = |v: f32| {
+        let v = v.clamp(0.0, 1.0);
+        let s = if v <= 0.003_130_8 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
+        (s * 255.0).round() as u32
+    };
+    let [r, g, b] = linear(lo);
+    (encode(r) << 16) | (encode(g) << 8) | encode(b)
+}
+
 fn build_lut() -> [u32; 256] {
     let mut lut = [0u32; 256];
     lut[0] = 0x0A0B12;
     for i in 1..=SAND_COLORS as usize {
         let hue = (i - 1) as f32 / SAND_COLORS as f32 * 360.0;
-        lut[i] = hsv(hue, 0.55, 0.97);
+        lut[i] = oklch(SAND_LIGHTNESS, SAND_CHROMA, hue);
     }
     for id in OBSTACLE_BASE as usize..256 {
         let hue = 200.0 + ((id * 37) % 60) as f32;
@@ -248,4 +292,3 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.run_app(&mut App::new()).expect("event loop error");
 }
-

@@ -19,7 +19,7 @@ pub const SAND_COLORS: u32 = 127;
 const GROW_TIME: f32 = 1.2;
 const SHRINK_TIME: f32 = 1.2;
 const EMITTER_FADE: f32 = 0.6;
-const HUE_SPEED: f32 = 8.0; // palette indices per second
+const HUE_SPEED: f32 = 15.0; // palette indices per second
 
 // ---------------------------------------------------------------------------
 // Tunable parameters
@@ -34,25 +34,25 @@ const HUE_SPEED: f32 = 8.0; // palette indices per second
 /// area (roughly one per 130 000 pixels at 1080p), clamped to 3..=120.
 const OBSTACLE_COUNT: Option<usize> = None;
 /// How much the number of obstacles wanted drifts over time.
-const OBSTACLE_COUNT_VARIANCE: f32 = 0.25;
+const OBSTACLE_COUNT_VARIANCE: f32 = 0.5;
 /// Average time in seconds an obstacle stays fully grown.
-const OBSTACLE_DURATION: f32 = 15.0;
-const OBSTACLE_DURATION_VARIANCE: f32 = 0.33;
+const OBSTACLE_DURATION: f32 = 10.0;
+const OBSTACLE_DURATION_VARIANCE: f32 = 0.5;
 
 /// Average number of sand streams. `None` picks a number from the screen width,
 /// clamped to 3..=8.
-const STREAM_COUNT: Option<usize> = Some(8);
+const STREAM_COUNT: Option<usize> = Some(1);
 /// How much the number of streams wanted drifts over time.
-const STREAM_COUNT_VARIANCE: f32 = 0.5;
+const STREAM_COUNT_VARIANCE: f32 = 0.0;
 /// Average grains per stream cell per substep (0.0 to 1.0).
-const STREAM_DENSITY: f32 = 0.50;
-const STREAM_DENSITY_VARIANCE: f32 = 1.00;
+const STREAM_DENSITY: f32 = 0.08;
+const STREAM_DENSITY_VARIANCE: f32 = 0.00;
 /// Average stream width in pixels.
-const STREAM_WIDTH: f32 = 30.0;
-const STREAM_WIDTH_VARIANCE: f32 = 0.7;
+const STREAM_WIDTH: f32 = 9999.0;
+const STREAM_WIDTH_VARIANCE: f32 = 0.0;
 /// Average time in seconds a stream flows.
-const STREAM_DURATION: f32 = 3.0;
-const STREAM_DURATION_VARIANCE: f32 = 0.8;
+const STREAM_DURATION: f32 = 9999.0;
+const STREAM_DURATION_VARIANCE: f32 = 0.0;
 
 /// The wanted obstacle and stream counts are redrawn this often (seconds,
 /// min and max).
@@ -67,7 +67,7 @@ const SLOPE_WEIGHT: f32 = 3.0;
 const DIAMOND_WEIGHT: f32 = 1.2;
 const CIRCLE_WEIGHT: f32 = 1.4;
 const FUNNEL_WEIGHT: f32 = 1.0;
-const LONG_HOLE_WEIGHT: f32 = 1.2;
+const LONG_HOLE_WEIGHT: f32 = 3.2;
 const CIRCLE_HOLE_WEIGHT: f32 = 1.2;
 /// Average time in seconds a hole stays open (never longer than its obstacle).
 const HOLE_DURATION: f32 = 10.0;
@@ -83,30 +83,30 @@ const STREAMS_ATTRACT_OBSTACLES: f32 = 0.8;
 const OBSTACLES_ATTRACT_STREAMS: f32 = 0.6;
 /// How strongly a new obstacle is placed so that the stream it makes falls
 /// onto another obstacle, rather than being the first acceptable spot.
-const OBSTACLE_CHAINING: f32 = 0.7;
+const OBSTACLE_CHAINING: f32 = 0.9;
 /// Streams wider than this (pixels, counting touching streams) are "wide".
 const WIDE_STREAM: f32 = 60.0;
 /// Smallest gap (pixels at 1080p) left between a new obstacle and the others,
 /// unless `WEIRD_OVERLAP` lets it through.
-const OBSTACLE_CLEARANCE: f32 = 28.0;
+const OBSTACLE_CLEARANCE: f32 = 20.0;
 
 // --- Weirdness (0.0 follows the rules strictly, 1.0 lets chance take over) ---
 //
 /// Chance the kind of obstacle ignores what the streams suggest.
-const WEIRD_KIND: f32 = 0.15;
+const WEIRD_KIND: f32 = 0.0;
 /// Chance an obstacle or stream is placed anywhere instead of by the rules.
-const WEIRD_PLACEMENT: f32 = 0.3;
+const WEIRD_PLACEMENT: f32 = 0.0;
 /// Chance of unusual angles and proportions: slopes outside 30-60 degrees,
 /// lopsided funnels, craters instead of clean cuts.
-const WEIRD_SHAPE: f32 = 0.15;
+const WEIRD_SHAPE: f32 = 0.0;
 /// Chance an obstacle may overlap others.
-const WEIRD_OVERLAP: f32 = 0.10;
+const WEIRD_OVERLAP: f32 = 0.05;
 /// Chance a slope redirects a stream forwards instead of backwards.
-const WEIRD_REDIRECT: f32 = 0.15;
+const WEIRD_REDIRECT: f32 = 0.1;
 /// Chance something may recreate a stream that has only just vanished.
-const WEIRD_LOOPS: f32 = 0.10;
+const WEIRD_LOOPS: f32 = 1.0;
 /// How long (seconds) a vanished stream is remembered.
-const LOOP_MEMORY: f32 = 8.0;
+const LOOP_MEMORY: f32 = 0.0;
 
 /// `mean` varied by up to plus or minus the fraction `variance`.
 fn vary(rng: &mut Rng, mean: f32, variance: f32) -> f32 {
