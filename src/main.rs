@@ -228,7 +228,7 @@ struct App {
     settings: Settings,
     /// Present in settings mode only.
     menu: Option<Menu>,
-    shift: bool,
+    mult: f32,
     /// The menu image must be redrawn (it changed, or the window did).
     overlay_dirty: bool,
     overlay_for: (u32, u32),
@@ -248,7 +248,7 @@ impl App {
             mouse_origin: None,
             settings,
             menu: configure.then(|| Menu::new(settings, store)),
-            shift: false,
+            mult: 1.0,
             overlay_dirty: true,
             overlay_for: (0, 0),
         }
@@ -285,10 +285,18 @@ impl App {
     fn config_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => self.apply(event_loop, menu::Effect { quit: true, ..Default::default() }),
-            WindowEvent::ModifiersChanged(m) => self.shift = m.state().shift_key(),
+            WindowEvent::ModifiersChanged(m) => {
+                let m = m.state();
+                self.mult = match (m.shift_key(), m.control_key()) {
+                    (false, false) => 1.0,
+                    (true, false) => 10.0,
+                    (false, true) => 100.0,
+                    (true, true) => 1000.0,
+                };
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let (Some(key), Some(menu)) = (translate(&event), &mut self.menu) {
-                    let fx = menu.key(key, self.shift);
+                    let fx = menu.key(key, self.mult);
                     self.apply(event_loop, fx);
                 }
             }

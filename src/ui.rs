@@ -128,16 +128,41 @@ impl Canvas {
     }
 }
 
-/// Greedy word wrap.
+/// Greedy word wrap. A `\n` always starts a new line.
 fn wrap(text: &str, cols: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
-        match lines.last_mut() {
-            Some(line) if line.chars().count() + 1 + word.chars().count() <= cols => {
-                line.push(' ');
-                line.push_str(word);
+    for paragraph in text.split('\n') {
+        let mut first = true;
+        for word in paragraph.split_whitespace() {
+            match lines.last_mut() {
+                Some(line) if !first && line.chars().count() + 1 + word.chars().count() <= cols => {
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                _ => lines.push(word.to_string()),
             }
-            _ => lines.push(word.to_string()),
+            first = false;
+        }
+    }
+    lines
+}
+
+/// Wrap hints separated by `|`, keeping each hint whole and spacing hints
+/// on the same line three columns apart. A `\n` always starts a new line.
+fn wrap_hints(text: &str, cols: usize) -> Vec<String> {
+    const GAP: &str = "   ";
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut first = true;
+        for hint in paragraph.split('|').map(str::trim).filter(|h| !h.is_empty()) {
+            match lines.last_mut() {
+                Some(line) if !first && line.chars().count() + GAP.len() + hint.chars().count() <= cols => {
+                    line.push_str(GAP);
+                    line.push_str(hint);
+                }
+                _ => lines.push(hint.to_string()),
+            }
+            first = false;
         }
     }
     lines
@@ -156,7 +181,7 @@ pub fn render(view: &View, scale: u32, max_h: u32) -> Image {
     let x0 = m + pad;
 
     let help = wrap(&view.help, COLS);
-    let keys = wrap(&view.keys, COLS);
+    let keys = wrap_hints(&view.keys, COLS);
     let status_lines = usize::from(!view.status.is_empty());
 
     let mut c = Canvas::new(tw, max_h);
@@ -275,6 +300,8 @@ mod tests {
     fn wraps_words() {
         assert_eq!(wrap("aa bb cc", 5), vec!["aa bb", "cc"]);
         assert_eq!(wrap("", 5), Vec::<String>::new());
+        assert_eq!(wrap("aa\nbb cc", 20), vec!["aa", "bb cc"]);
+        assert_eq!(wrap_hints("a b | c d | e", 8), vec!["a b", "c d   e"]);
     }
 
     #[test]

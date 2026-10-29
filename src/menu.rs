@@ -205,9 +205,9 @@ impl Menu {
         level.sel = (level.sel as isize + delta).rem_euclid(n) as usize;
     }
 
-    /// Handle a key press (also key repeats). `shift` makes adjustments ten
-    /// times bigger.
-    pub fn key(&mut self, key: Key, shift: bool) -> Effect {
+    /// Handle a key press (also key repeats). `mult` scales adjustments
+    /// (1, 10, 100 or 1000 depending on Shift and Ctrl).
+    pub fn key(&mut self, key: Key, mult: f32) -> Effect {
         let mut fx = Effect::default();
         if !self.visible {
             self.visible = true;
@@ -247,7 +247,6 @@ impl Menu {
                 _ => {}
             },
             Screen::Adjust(i) => {
-                let mult = if shift { 10.0 } else { 1.0 };
                 let before = self.settings;
                 match key {
                     Key::Up => self.settings.adjust(i, 1.0, mult),
@@ -397,11 +396,11 @@ impl Menu {
         let folders = settings::folders();
         let mut crumbs = "Settings".to_string();
         let mut help = String::new();
-        let mut keys = "Up/Down move  Right open  Left back".to_string();
+        let mut keys = "Up/Down move|Right open|Left back".to_string();
 
         let body = match &level.screen {
             Screen::Root => {
-                keys = "Up/Down move  Right open  Esc exit  Tab hide  R restart".to_string();
+                keys = "Up/Down move|Right open|Esc exit|Tab hide|R restart".to_string();
                 let mut rows = vec![Row {
                     label: "Presets".into(),
                     value: self.preset_label(),
@@ -441,7 +440,7 @@ impl Menu {
                 let item = &ITEMS[*i];
                 crumbs = format!("Settings > {} > {}", item.folder, item.name);
                 help = item.help.to_string();
-                keys = "Up/Down adjust  Shift x10  Bksp reset  Left back".to_string();
+                keys = "Up/Down adjust|Shift x10|Ctrl x100|Both x1000|Bksp reset|Left back".to_string();
                 Body::Adjust {
                     name: item.name.to_string(),
                     value: item.text(&self.settings),
@@ -452,7 +451,7 @@ impl Menu {
             }
             Screen::Presets => {
                 crumbs = "Settings > Presets".to_string();
-                keys = "Up/Down move  Enter load  Right more  Left back".to_string();
+                keys = "Up/Down move|Enter load|Right more|Left back".to_string();
                 let mut rows = vec![Row {
                     label: "+ Save current as new".into(),
                     value: String::new(),
@@ -476,6 +475,7 @@ impl Menu {
             }
             Screen::PresetMenu(i) => {
                 crumbs = format!("Settings > Presets > {}", self.preset(*i).name);
+                keys = "Up/Down move|Enter or Right select|Left back".to_string();
                 let labels: Vec<&str> = if self.is_custom(*i) {
                     vec![
                         "Load",
@@ -494,7 +494,7 @@ impl Menu {
             }
             Screen::Naming { text, .. } => {
                 crumbs = "Settings > Presets > Name".to_string();
-                keys = "Type a name  Enter ok  Esc cancel".to_string();
+                keys = "Type a name|Enter ok|Esc cancel".to_string();
                 Body::Naming { text: text.clone() }
             }
         };
@@ -515,7 +515,7 @@ mod tests {
     fn press(m: &mut Menu, keys: &[Key]) -> Effect {
         let mut last = Effect::default();
         for &k in keys {
-            last = m.key(k, false);
+            last = m.key(k, 1.0);
         }
         last
     }
@@ -537,10 +537,10 @@ mod tests {
         let fx = press(&mut m, &[Key::Up]);
         assert!(fx.changed);
         assert!(m.settings.stream_density > before);
-        let fx = m.key(Key::Down, true);
+        let fx = m.key(Key::Down, 10.0);
         assert!(fx.changed);
         assert!(m.settings.stream_density < before);
-        m.key(Key::Backspace, false);
+        m.key(Key::Backspace, 1.0);
         assert_eq!(m.settings.stream_density, Settings::default().stream_density);
         // Back out; Esc at the root quits.
         press(&mut m, &[Key::Left, Key::Left]);
@@ -553,9 +553,9 @@ mod tests {
     #[test]
     fn hidden_menu_ignores_the_first_key() {
         let (mut m, dir) = menu("hide");
-        m.key(Key::Tab, false);
+        m.key(Key::Tab, 1.0);
         assert!(!m.visible);
-        m.key(Key::Down, false);
+        m.key(Key::Down, 1.0);
         assert!(m.visible);
         assert_eq!(m.top().sel, 0);
         let _ = std::fs::remove_dir_all(dir);
@@ -568,7 +568,7 @@ mod tests {
 
         // Load a built-in: Presets > row 2 (Drizzle).
         press(&mut m, &[Key::Right, Key::Down, Key::Down]);
-        let fx = m.key(Key::Enter, false);
+        let fx = m.key(Key::Enter, 1.0);
         assert!(fx.changed);
         assert_eq!(m.settings, m.builtin[1].settings);
         assert_eq!(m.view().preset, "Drizzle");
@@ -579,7 +579,7 @@ mod tests {
         press(&mut m, &[Key::Up, Key::Up, Key::Enter]);
         assert!(matches!(m.top().screen, Screen::Naming { .. }));
         for _ in 0..20 {
-            m.key(Key::Backspace, false);
+            m.key(Key::Backspace, 1.0);
         }
         press(&mut m, &[Key::Char('H'), Key::Char('i'), Key::Char('['), Key::Enter]);
         assert_eq!(m.custom.len(), 1);
