@@ -107,6 +107,14 @@ settings! {
             "Obstacles on screen on average. Auto picks a number from the screen area.";
         obstacle_count_variance: "Count drift", 0.25, 0.0, 1.0, 0.05, Percent,
             "How far the wanted number of obstacles wanders over time.";
+        obstacle_scale: "Scale", 1.0, 0.25, 3.0, 0.05, Percent,
+            "Size of obstacles along their long direction. Circles and diamonds scale in every direction.";
+        obstacle_scale_variance: "Scale variation", 0.0, 0.0, 1.0, 0.05, Percent,
+            "How much scales differ from one obstacle to the next, on top of the usual variety.";
+        obstacle_thickness: "Thickness", 14.0, 2.0, 100.0, 1.0, Px,
+            "Thickness of slopes and funnel walls. Slots are cut one and a half times as thick.";
+        obstacle_thickness_variance: "Thickness variation", 0.3, 0.0, 1.0, 0.05, Percent,
+            "How much thicknesses differ from one obstacle to the next.";
         obstacle_duration: "Lifetime", 15.0, 2.0, 120.0, 1.0, Secs,
             "How long an obstacle stays fully formed.";
         obstacle_duration_variance: "Lifetime variation", 0.35, 0.0, 1.0, 0.05, Percent,
@@ -181,9 +189,9 @@ settings! {
             "Perceived brightness of the sand.";
         sand_chroma: "Chroma", 0.11, 0.0, 0.20, 0.005, Dec3,
             "How colorful the sand is. Very high values clip.";
-        hue_start: "Start hue", 0.0, 0.0, 355.0, 5.0, Deg,
+        hue_start: "Start hue", 0.0, 0.0, 355.0, 1.0, Deg,
             "Where on the color wheel the palette starts.";
-        hue_span: "Hue range", 360.0, 20.0, 360.0, 5.0, Deg,
+        hue_span: "Hue range", 360.0, 20.0, 360.0, 1.0, Deg,
             "How much of the color wheel the palette covers.";
         hue_speed: "Color speed", 15.0, 0.0, 60.0, 1.0, Int,
             "How fast streams cycle through the palette.";
@@ -301,16 +309,77 @@ pub fn builtin() -> Vec<Preset> {
     let d = Settings::default();
     let p = |name: &str, settings: Settings| Preset { name: name.to_string(), settings };
     vec![
-        p("Default", d),
+        // Template: every field at its default value. Copy it, rename it and
+        // change what you want; fields left out fall back to `..d`.
+        //
+        // p(
+        //     "Example",
+        //     Settings {
+        //         // Obstacles
+        //         obstacle_count: 0.0, // 0 = auto
+        //         obstacle_count_variance: 0.25,
+        //         obstacle_scale: 1.0,
+        //         obstacle_scale_variance: 0.0,
+        //         obstacle_thickness: 14.0,
+        //         obstacle_thickness_variance: 0.3,
+        //         obstacle_duration: 15.0,
+        //         obstacle_duration_variance: 0.35,
+        //         obstacle_clearance: 28.0,
+        //         hole_duration: 10.0,
+        //         hole_duration_variance: 0.4,
+        //         // Obstacle kinds
+        //         slope_weight: 3.0,
+        //         diamond_weight: 1.2,
+        //         circle_weight: 1.4,
+        //         funnel_weight: 1.0,
+        //         long_hole_weight: 1.2,
+        //         circle_hole_weight: 1.2,
+        //         // Streams
+        //         stream_count: 8.0, // 0 = auto
+        //         stream_count_variance: 0.5,
+        //         stream_density: 0.5,
+        //         stream_density_variance: 1.0,
+        //         stream_width: 30.0,
+        //         stream_width_variance: 0.7,
+        //         stream_duration: 3.0,
+        //         stream_duration_variance: 0.8,
+        //         // Influence
+        //         streams_attract_obstacles: 0.8,
+        //         obstacles_attract_streams: 0.6,
+        //         obstacle_chaining: 0.7,
+        //         wide_stream: 60.0,
+        //         // Weirdness
+        //         weird_kind: 0.15,
+        //         weird_placement: 0.15,
+        //         weird_shape: 0.15,
+        //         weird_overlap: 0.10,
+        //         weird_redirect: 0.15,
+        //         weird_loops: 0.10,
+        //         loop_memory: 8.0,
+        //         // Colors
+        //         sand_lightness: 0.80,
+        //         sand_chroma: 0.11,
+        //         hue_start: 0.0,
+        //         hue_span: 360.0,
+        //         hue_speed: 15.0,
+        //     },
+        // ),
         p(
-            "Drizzle",
+            "Default",
             Settings {
-                obstacle_count: 8.0,
-                stream_count: 5.0,
-                stream_width: 14.0,
-                stream_density: 0.3,
-                stream_duration: 6.0,
-                stream_duration_variance: 0.4,
+                ..d
+            },
+        ),
+        p(
+            "Slow",
+            Settings {
+                obstacle_duration: 60.0,
+                obstacle_duration_variance: 0.6,
+                stream_width: 5.0,
+                stream_density: 0.8,
+                stream_duration: 60.0,
+                stream_duration_variance: 0.6,
+                hue_speed: 6.0,
                 weird_kind: 0.0,
                 weird_placement: 0.0,
                 weird_shape: 0.0,
@@ -320,19 +389,29 @@ pub fn builtin() -> Vec<Preset> {
         p(
             "Cascade",
             Settings {
-                obstacle_count: 30.0,
-                obstacle_count_variance: 0.1,
+                obstacle_count: 80.0,
+                obstacle_count_variance: 0.2,
+                obstacle_thickness: 5.0,
+                obstacle_thickness_variance: 0.0,
+                obstacle_scale: 0.3,
+                obstacle_scale_variance: 1.0,
+                obstacle_duration: 10.0,
+                obstacle_duration_variance: 0.5,
                 stream_count: 4.0,
-                stream_count_variance: 0.0,
-                stream_width: 40.0,
-                stream_duration: 12.0,
-                streams_attract_obstacles: 1.0,
-                obstacle_chaining: 1.0,
-                slope_weight: 6.0,
-                weird_kind: 0.05,
+                stream_count_variance: 0.5,
+                stream_width: 15.0,
+                stream_density: 0.8,
+                stream_duration: 10.0,
+                streams_attract_obstacles: 0.8,
+                obstacles_attract_streams: 0.2,
+                obstacle_chaining: 0.8,
+                slope_weight: 8.0,
+                long_hole_weight: 0.0,
+                circle_hole_weight: 0.0,
+                weird_kind: 0.0,
                 weird_placement: 0.0,
                 weird_shape: 0.0,
-                weird_loops: 0.0,
+                weird_loops: 0.9,
                 ..d
             },
         ),
@@ -346,7 +425,13 @@ pub fn builtin() -> Vec<Preset> {
                 circle_hole_weight: 2.0,
                 long_hole_weight: 0.0,
                 obstacle_count: 20.0,
-                stream_width: 60.0,
+                obstacle_clearance: 40.0,
+                stream_width: 120.0,
+                stream_density: 0.85,
+                stream_density_variance: 0.05,
+                obstacle_scale: 1.2,
+                obstacle_scale_variance: 0.5,
+                weird_overlap: 0.0,
                 ..d
             },
         ),
@@ -359,9 +444,10 @@ pub fn builtin() -> Vec<Preset> {
                 circle_weight: 0.0,
                 long_hole_weight: 0.5,
                 circle_hole_weight: 0.0,
-                obstacle_count: 10.0,
-                stream_count: 6.0,
-                stream_width: 50.0,
+                obstacle_count: 20.0,
+                obstacle_scale_variance: 0.6,
+                stream_count: 30.0,
+                stream_width: 5.0,
                 weird_shape: 0.05,
                 ..d
             },
@@ -375,18 +461,20 @@ pub fn builtin() -> Vec<Preset> {
                 obstacle_duration_variance: 0.8,
                 stream_count: 12.0,
                 stream_count_variance: 0.8,
-                weird_kind: 0.6,
-                weird_placement: 0.7,
-                weird_shape: 0.7,
-                weird_overlap: 0.6,
+                long_hole_weight: 3.0,
+                circle_hole_weight: 3.0,
+                weird_kind: 0.9,
+                weird_placement: 0.9,
+                weird_shape: 0.9,
+                weird_overlap: 0.4,
                 weird_redirect: 0.5,
                 weird_loops: 0.6,
-                hue_speed: 40.0,
+                hue_speed: 30.0,
                 ..d
             },
         ),
         p(
-            "Sheet",
+            "Rain",
             Settings {
                 obstacle_count_variance: 0.5,
                 obstacle_duration: 10.0,
@@ -409,26 +497,59 @@ pub fn builtin() -> Vec<Preset> {
                 weird_redirect: 0.1,
                 weird_loops: 1.0,
                 loop_memory: 0.0,
+                hue_start: 220.0,
+                hue_span: 50.0,
+                sand_lightness: 0.55,
+                sand_chroma: 0.2,
+                hue_speed: 2.0,
                 ..d
             },
         ),
         p(
-            "Ocean",
+            "Magma",
             Settings {
-                hue_start: 170.0,
-                hue_span: 100.0,
+                stream_count: 30.0,
+                stream_width: 5.0,
+                stream_width_variance: 0.0,
+                stream_density: 1.0,
+                stream_duration: 0.2,
+                stream_duration_variance: 1.0,
+                hue_start: 18.0,
+                hue_span: 27.0,
+                sand_lightness: 0.53,
+                sand_chroma: 0.2,
+                hue_speed: 60.0,
+                ..d
+            },
+        ),
+        p(
+            "Eden's Favourite",
+            Settings {
+                obstacle_count_variance: 0.5,
+                obstacle_duration: 10.0,
+                obstacle_duration_variance: 0.5,
+                obstacle_clearance: 20.0,
+                obstacle_scale: 0.5,
+                stream_count: 4.0,
+                stream_count_variance: 0.5,
+                stream_density: 0.08,
+                stream_density_variance: 0.5,
+                stream_width: 1000.0,
+                stream_width_variance: 0.8,
+                stream_duration: 10.0,
+                stream_duration_variance: 1.0,
+                funnel_weight: 2.0,
+                long_hole_weight: 3.2,
+                obstacle_chaining: 0.3,
+                streams_attract_obstacles: 0.5,
+                weird_kind: 0.1,
+                weird_placement: 0.1,
+                weird_shape: 0.1,
+                weird_overlap: 0.05,
+                weird_redirect: 0.1,
+                weird_loops: 1.0,
+                loop_memory: 0.0,
                 sand_lightness: 0.75,
-                sand_chroma: 0.12,
-                hue_speed: 8.0,
-                ..d
-            },
-        ),
-        p(
-            "Ember",
-            Settings {
-                hue_start: 15.0,
-                hue_span: 70.0,
-                sand_lightness: 0.72,
                 sand_chroma: 0.15,
                 hue_speed: 10.0,
                 ..d

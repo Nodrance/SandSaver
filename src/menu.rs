@@ -468,8 +468,8 @@ impl Menu {
                 }));
                 help = match level.sel {
                     0 => "Stores the current settings as a new custom preset.".to_string(),
-                    n if self.is_custom(n - 1) => "Custom preset. Enter loads it; Right can rename or delete it.".to_string(),
-                    _ => "Built-in preset. Enter loads it; Right can copy it.".to_string(),
+                    n if self.is_custom(n - 1) => "Custom preset. Enter loads it, Right can rename or delete it.".to_string(),
+                    _ => "Built-in preset. Enter loads it, Right can copy it.".to_string(),
                 };
                 Body::List { rows, sel: level.sel }
             }
@@ -564,18 +564,18 @@ mod tests {
     #[test]
     fn presets_load_save_rename_delete() {
         let (mut m, dir) = menu("presets");
-        assert_eq!(m.view().preset, "Default");
+        let name = m.builtin[1].name.clone();
 
-        // Load a built-in: Presets > row 2 (Drizzle).
+        // Load a built-in: Presets > row 2 (the second built-in).
         press(&mut m, &[Key::Right, Key::Down, Key::Down]);
         let fx = m.key(Key::Enter, 1.0);
         assert!(fx.changed);
         assert_eq!(m.settings, m.builtin[1].settings);
-        assert_eq!(m.view().preset, "Drizzle");
+        assert_eq!(m.view().preset, name);
 
         // Modify it, then save as a new preset and rename it.
         m.settings.stream_width = 100.0;
-        assert_eq!(m.view().preset, "Drizzle (modified)");
+        assert_eq!(m.view().preset, format!("{name} (modified)"));
         press(&mut m, &[Key::Up, Key::Up, Key::Enter]);
         assert!(matches!(m.top().screen, Screen::Naming { .. }));
         for _ in 0..20 {
@@ -607,10 +607,10 @@ mod tests {
     #[test]
     fn copying_a_builtin_and_unique_names() {
         let (mut m, dir) = menu("copy");
-        // Presets > Default > Copy to custom.
+        // Presets > first built-in > Copy to custom.
         press(&mut m, &[Key::Right, Key::Down, Key::Right, Key::Down, Key::Right]);
         assert_eq!(m.custom.len(), 1);
-        assert_eq!(m.custom[0].name, "Default copy");
+        assert_eq!(m.custom[0].name, format!("{} copy", m.builtin[0].name));
         // Save current as new, twice: names stay unique. The selection sits on
         // the last row, so Down wraps to the first.
         press(&mut m, &[Key::Down, Key::Right, Key::Esc]);

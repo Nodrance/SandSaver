@@ -470,10 +470,21 @@ impl World {
         Some((i, f.y + gap))
     }
 
+    /// A scale for one new obstacle's size along its long direction.
+    fn scale(&mut self) -> f32 {
+        vary(&mut self.rng, self.s.obstacle_scale, self.s.obstacle_scale_variance).max(0.1)
+    }
+
+    /// Half the thickness of a new slope, funnel wall or slot, in cells.
+    fn half_thick(&mut self) -> f32 {
+        let t = vary(&mut self.rng, self.s.obstacle_thickness, self.s.obstacle_thickness_variance);
+        (t * 0.5 * self.unit).max(self.unit)
+    }
+
     fn slope_candidate(&mut self, flows: &[Flow]) -> Option<Cand> {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
-        let hl = self.rng.range(110.0, 260.0) * k;
-        let ht = self.rng.range(5.0, 9.0) * k;
+        let hl = self.rng.range(110.0, 260.0) * k * self.scale();
+        let ht = self.half_thick();
         let (lo, hi) = if self.rng.chance(self.s.weird_shape) { (8.0, 80.0) } else { (31.0, 59.0) };
         let mag = self.rng.range(lo, hi).to_radians();
         let (cos, sin) = (mag.cos(), mag.sin());
@@ -510,7 +521,7 @@ impl World {
 
     fn diamond_candidate(&mut self, flows: &[Flow]) -> Option<Cand> {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
-        let q = self.rng.range(30.0, 75.0) * k;
+        let q = self.rng.range(30.0, 75.0) * k * self.scale();
         let (lo, hi) = if self.rng.chance(self.s.weird_shape) { (2.0, 88.0) } else { (31.0, 59.0) };
         let theta = self.rng.sign() * self.rng.range(lo, hi).to_radians();
         let shape = Shape::new(Kind::Rect { hl: q, ht: q }, theta);
@@ -541,7 +552,7 @@ impl World {
 
     fn circle_candidate(&mut self, flows: &[Flow]) -> Option<Cand> {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
-        let r = self.rng.range(35.0, 95.0) * k;
+        let r = self.rng.range(35.0, 95.0) * k * self.scale();
         let (x_land, y_land) = if let Some((i, y_land)) = self.target_flow(flows) {
             let f = &flows[i];
             let jitter = if wideness(flows, i, k, self.s.wide_stream) > 1.0 {
@@ -565,7 +576,7 @@ impl World {
 
     fn funnel_candidate(&mut self, flows: &[Flow]) -> Option<Cand> {
         let (k, w, h) = (self.unit, self.w as f32, self.h as f32);
-        let hl = self.rng.range(55.0, 120.0) * k;
+        let hl = self.rng.range(55.0, 120.0) * k * self.scale();
         let gap = if self.rng.chance(0.15) {
             self.rng.range(80.0, 160.0)
         } else {
@@ -605,7 +616,7 @@ impl World {
             (self.rng.range(0.1 * w, 0.9 * w), self.rng.range(0.12 * h, 0.7 * h))
         };
 
-        let ht = self.rng.range(5.0, 9.0) * k;
+        let ht = self.half_thick();
         let (vt_l, vt_r) = (ht / a_l.cos(), ht / a_r.cos());
         let (m_l, m_r) = (a_l.tan(), a_r.tan());
         let cy_l = y_rim + m_l * hl + vt_l;
@@ -698,11 +709,11 @@ impl World {
             }
             .to_radians();
             let theta = FRAC_PI_2 + a;
-            let half_w = self.rng.range(6.0, 15.0) * k;
+            let half_w = self.half_thick() * 1.5;
             let (lh, hx, hy) = if !self.rng.chance(0.2 + 0.6 * weird) {
                 // Cut clean through.
                 let need = span * 0.5 * self.rng.range(1.2, 1.6) / a.cos().max(0.5) + 10.0 * k;
-                (need.max(self.rng.range(50.0, 110.0) * k), x, (top + bot) * 0.5)
+                (need.max(self.rng.range(50.0, 110.0) * k * self.scale()), x, (top + bot) * 0.5)
             } else {
                 // Only a crater.
                 let lh = (span * self.rng.range(0.25, 0.7)).max(20.0 * k);
